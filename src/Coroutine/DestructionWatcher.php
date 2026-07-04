@@ -39,11 +39,16 @@ class DestructionWatcher
 
     /**
      * Destructor - execute all registered callbacks in reverse order (LIFO).
+     * 每个回调独立 try/catch，避免单个回调异常中断后续清理。
      */
     public function __destruct()
     {
         foreach (array_reverse($this->callbacks) as $callback) {
-            $callback();
+            try {
+                $callback();
+            } catch (\Throwable $e) {
+                error_log('[DestructionWatcher] callback threw: ' . $e->getMessage());
+            }
         }
     }
 }

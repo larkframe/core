@@ -5,6 +5,16 @@ namespace LarkFrame\Util;
 class Img
 {
     /**
+     * P2-20：检查 GD 扩展是否加载，fail-fast 避免后续 "Call to undefined function" fatal error。
+     */
+    private static function ensureGd(): void
+    {
+        if (!extension_loaded('gd')) {
+            throw new \RuntimeException('GD extension is required for image manipulation. Please install/enable ext-gd.');
+        }
+    }
+
+    /**
      * 将图片转换为 ICO 格式
      *
      * @param string $sourcePath 源图片路径
@@ -15,6 +25,7 @@ class Img
      */
     public static function convertToIco(string $sourcePath, string $destinationPath, int $width = 32, int $height = 32): bool
     {
+        static::ensureGd();
         if (!file_exists($sourcePath)) {
             return false;
         }
@@ -71,6 +82,7 @@ class Img
      */
     public static function resize(string $sourcePath, string $destinationPath, int $width, int $height, bool $keepAspectRatio = true): bool
     {
+        static::ensureGd();
         $imageInfo = @getimagesize($sourcePath);
         if (!$imageInfo) {
             return false;
@@ -86,6 +98,23 @@ class Img
 
         if (!$srcImage) {
             return false;
+        }
+
+        // P2-43 方案 A：JPEG 照片根据 EXIF Orientation 旋转，避免缩略图方向错误（手机拍摄纵向照片）
+        if ($imageInfo[2] === IMAGETYPE_JPEG && function_exists('exif_read_data')) {
+            $exif = @exif_read_data($sourcePath);
+            if (!empty($exif['Orientation'])) {
+                $rotated = match ((int)$exif['Orientation']) {
+                    3 => imagerotate($srcImage, 180, 0),
+                    6 => imagerotate($srcImage, -90, 0),
+                    8 => imagerotate($srcImage, 90, 0),
+                    default => null,
+                };
+                if ($rotated !== null) {
+                    imagedestroy($srcImage);
+                    $srcImage = $rotated;
+                }
+            }
         }
 
         $srcWidth = imagesx($srcImage);
@@ -124,6 +153,7 @@ class Img
      */
     public static function toDataUri(string $path): string
     {
+        static::ensureGd();
         if (!file_exists($path)) {
             return '';
         }

@@ -106,10 +106,11 @@ class Context
         $fiber = Fiber::getCurrent();
 
         if ($fiber === null) {
-            // In non-Fiber mode, trigger onDestroy callbacks before clearing
+            // In non-Fiber mode, trigger onDestroy callbacks via GC before clearing
             $onDestroyObj = self::$nonFiberContext['context.onDestroy'] ?? null;
             if ($onDestroyObj !== null) {
                 unset(self::$nonFiberContext['context.onDestroy']);
+                gc_collect_cycles();
             }
             self::$nonFiberContext = new ArrayObject([], ArrayObject::ARRAY_AS_PROPS);
             return;
@@ -152,6 +153,32 @@ class Context
     {
         self::$contexts = new WeakMap();
         self::$nonFiberContext = new ArrayObject([], ArrayObject::ARRAY_AS_PROPS);
+    }
+
+    /**
+     * P2-27：扫描清理已终止/未启动的 Fiber 上下文，防止长生命周期 worker 中
+     * 因外部持有 Fiber 引用导致 WeakMap 中的上下文数据无法回收。
+     * 建议在事件循环空闲或定时器中周期性调用（如每 60s）。
+     */
+    public static function gc(): void
+    {
+        if (!isset(self::$contexts)) {
+            return;
+        }
+        // Copy keys first — modifying a WeakMap during iteration skips entries
+        $fibers = [];
+        foreach (self::$contexts as $fiber => $_) {
+            $fibers[] = $fiber;
+        }
+        foreach ($fibers as $fiber) {
+            if (!$fiber->isStarted() || $fiber->isTerminated()) {
+                // Remove onDestroy reference so DestructionWatcher can detect it
+                unset(self::$contexts[$fiber]['context.onDestroy']);
+                unset(self::$contexts[$fiber]);
+            }
+        }
+        // Force GC to collect orphaned onDestroy objects and trigger callbacks
+        gc_collect_cycles();
     }
 }
 

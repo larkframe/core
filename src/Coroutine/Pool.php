@@ -4,10 +4,17 @@ namespace LarkFrame\Coroutine;
 
 use Closure;
 use Fiber;
+use LarkFrame\Consts;
 use LarkFrame\Events\EventInterface;
 use stdClass;
 use Throwable;
 use WeakMap;
+use function class_exists;
+use function count;
+use function defined;
+use function gettype;
+use function max;
+use function microtime;
 
 /**
  * Class Pool
@@ -75,6 +82,11 @@ class Pool implements PoolInterface
     private ?Closure $connectionHeartbeatHandler = null;
 
     /**
+     * Whether to force coroutine mode (Server 模式启动期也走协程分支，消除启动时机决定路径的隐式依赖).
+     */
+    private readonly bool $forceCoroutineMode;
+
+    /**
      * Constructor with property promotion for config values.
      */
     public function __construct(
@@ -84,6 +96,7 @@ class Pool implements PoolInterface
         private readonly float $idleTimeout = 60.0,
         private readonly float $heartbeatInterval = 50.0,
         private readonly float $waitTimeout = 10.0,
+        bool $forceCoroutineMode = false,
     ) {
         $this->channel = new MemoryChannel($maxConnections);
         $this->connections = new WeakMap();
@@ -91,6 +104,7 @@ class Pool implements PoolInterface
         $this->lastHeartbeatTimes = new WeakMap();
         $this->connectionStatus = new WeakMap();
         $this->createdAt = new WeakMap();
+        $this->forceCoroutineMode = $forceCoroutineMode;
     }
 
     /**
@@ -104,6 +118,9 @@ class Pool implements PoolInterface
             $camelCased[$camelKey] = $value;
         }
 
+        // Server 模式下强制协程分支，避免启动期误创建 nonCoroutineConnection 串行化瓶颈
+        $forceCoroutine = defined('RUN_TYPE') && RUN_TYPE === Consts::RUN_TYPE_SERVER;
+
         return new self(
             maxConnections: $maxConnections,
             config: $config,
@@ -111,6 +128,7 @@ class Pool implements PoolInterface
             idleTimeout: (float)($camelCased['idleTimeout'] ?? 60.0),
             heartbeatInterval: (float)($camelCased['heartbeatInterval'] ?? 50.0),
             waitTimeout: (float)($camelCased['waitTimeout'] ?? 10.0),
+            forceCoroutineMode: $forceCoroutine,
         );
     }
 
@@ -146,11 +164,19 @@ class Pool implements PoolInterface
      */
     public function get(): object
     {
-        // Non-coroutine: reuse a single connection
+        // Non-coroutine: reuse a single connection with heartbeat validation
         if (!$this->isCoroutine()) {
-            if (!$this->nonCoroutineConnection) {
+            // 已有连接则用心跳回调校验活性，避免返回已被服务端关闭的死连接
+            if ($this->nonCoroutineConnection !== null && $this->connectionHeartbeatHandler !== null) {
+                try {
+                    ($this->connectionHeartbeatHandler)($this->nonCoroutineConnection);
+                } catch (Throwable) {
+                    $this->closeConnection($this->nonCoroutineConnection);
+                    $this->nonCoroutineConnection = null;
+                }
+            }
+            if ($this->nonCoroutineConnection === null) {
                 $this->nonCoroutineConnection = $this->createConnection();
-                $this->connections[$this->nonCoroutineConnection] = 1;
             }
             $this->connectionStatus[$this->nonCoroutineConnection] = ConnectionStatus::Active;
             return $this->nonCoroutineConnection;
@@ -158,7 +184,18 @@ class Pool implements PoolInterface
 
         $num = $this->channel->length();
         if ($num === 0 && $this->getConnectionCount() < $this->maxConnections) {
-            return $this->createConnection();
+            // 预占槽位，消除"判定与插入之间的并发窗口"
+            $placeholder = new stdClass();
+            $this->connections[$placeholder] = true;
+            try {
+                $connection = $this->instantiateConnection();
+                unset($this->connections[$placeholder]);
+                $this->registerConnection($connection);
+                return $connection;
+            } catch (Throwable $e) {
+                unset($this->connections[$placeholder]);
+                throw $e;
+            }
         }
 
         $connection = $this->channel->pop($this->waitTimeout);
@@ -168,7 +205,7 @@ class Pool implements PoolInterface
             );
         }
 
-        $this->lastUsedTimes[$connection] = time();
+        $this->lastUsedTimes[$connection] = microtime(true);
         $this->connectionStatus[$connection] = ConnectionStatus::Active;
         return $connection;
     }
@@ -210,32 +247,48 @@ class Pool implements PoolInterface
         $this->connections[$placeholder] = true;
 
         try {
-            if ($this->connectionCreateHandler === null) {
-                throw new PoolException('CreateConnection failed, no connection creator set.');
-            }
-
-            $connection = ($this->connectionCreateHandler)();
-
-            if (!is_object($connection)) {
-                throw new PoolException(
-                    'CreateConnection failed, expected a connection object, but got ' . gettype($connection) . '.'
-                );
-            }
-
+            $connection = $this->instantiateConnection();
             unset($this->connections[$placeholder]);
-
-            $now = time();
-            $this->connections[$connection] = true;
-            $this->lastUsedTimes[$connection] = $now;
-            $this->lastHeartbeatTimes[$connection] = $now;
-            $this->createdAt[$connection] = $now;
-            $this->connectionStatus[$connection] = ConnectionStatus::Active;
+            $this->registerConnection($connection);
         } catch (Throwable $throwable) {
             unset($this->connections[$placeholder]);
             throw $throwable;
         }
 
         return $connection;
+    }
+
+    /**
+     * Instantiate connection via creator handler (shared by createConnection and get).
+     */
+    private function instantiateConnection(): object
+    {
+        if ($this->connectionCreateHandler === null) {
+            throw new PoolException('CreateConnection failed, no connection creator set.');
+        }
+
+        $connection = ($this->connectionCreateHandler)();
+
+        if (!is_object($connection)) {
+            throw new PoolException(
+                'CreateConnection failed, expected a connection object, but got ' . gettype($connection) . '.'
+            );
+        }
+
+        return $connection;
+    }
+
+    /**
+     * Register a new connection into pool tracking structures.
+     */
+    private function registerConnection(object $connection): void
+    {
+        $now = microtime(true);
+        $this->connections[$connection] = true;
+        $this->lastUsedTimes[$connection] = $now;
+        $this->lastHeartbeatTimes[$connection] = $now;
+        $this->createdAt[$connection] = $now;
+        $this->connectionStatus[$connection] = ConnectionStatus::Active;
     }
 
     /**
@@ -276,6 +329,9 @@ class Pool implements PoolInterface
      */
     public function closeConnections(): void
     {
+        // 先清空 nonCoroutineConnection 引用，避免后续 foreach 重复关闭
+        $this->nonCoroutineConnection = null;
+
         // Close idle connections from the channel
         $num = $this->channel->length();
         for ($i = $num; $i > 0; $i--) {
@@ -287,12 +343,13 @@ class Pool implements PoolInterface
         }
 
         // Close active (borrowed) connections tracked in the WeakMap
+        // Copy keys first — modifying a WeakMap during iteration skips entries
+        $connections = [];
         foreach ($this->connections as $connection => $_) {
-            $this->closeConnection($connection);
+            $connections[] = $connection;
         }
-
-        if ($this->nonCoroutineConnection !== null) {
-            $this->closeConnection($this->nonCoroutineConnection);
+        foreach ($connections as $connection) {
+            $this->closeConnection($connection);
         }
     }
 
@@ -309,7 +366,7 @@ class Pool implements PoolInterface
      */
     protected function isCoroutine(): bool
     {
-        return class_exists(Fiber::class) && Fiber::getCurrent() !== null;
+        return $this->forceCoroutineMode || (class_exists(Fiber::class) && Fiber::getCurrent() !== null);
     }
 
     /**
@@ -320,8 +377,8 @@ class Pool implements PoolInterface
         try {
             \LarkFrame\Log::info((string)$message);
         } catch (Throwable) {
-            // Fallback to echo if logger is unavailable
-            echo $message . PHP_EOL;
+            // Fallback to error_log if logger is unavailable
+            error_log((string)$message);
         }
     }
 
@@ -368,8 +425,7 @@ class Pool implements PoolInterface
      */
     protected function recycleIdleConnections(): void
     {
-        $now = time();
-        $checked = [];
+        $now = microtime(true);
 
         // Drain the channel, check each connection, and put back non-expired ones
         $num = $this->channel->length();
@@ -379,14 +435,17 @@ class Pool implements PoolInterface
                 break;
             }
 
+            // closeConnection 会从 WeakMap 移除，getConnectionCount() 反映真实剩余数
+            if ($this->getConnectionCount() <= $this->minConnections) {
+                $this->channel->push($connection);
+                continue;
+            }
+
             $lastUsed = $this->lastUsedTimes[$connection] ?? $now;
             $idleSeconds = $now - $lastUsed;
 
-            // Keep minimum connections alive
-            $activeCount = $this->getConnectionCount() - count($checked);
-            if ($idleSeconds < $this->idleTimeout || $activeCount <= $this->minConnections) {
+            if ($idleSeconds < $this->idleTimeout) {
                 $this->channel->push($connection);
-                $checked[] = $connection;
             } else {
                 $this->closeConnection($connection);
                 $this->log("Recycled idle connection (idle {$idleSeconds}s)");
@@ -404,8 +463,7 @@ class Pool implements PoolInterface
             return;
         }
 
-        $now = time();
-        $checked = [];
+        $now = microtime(true);
 
         // Drain the channel, check heartbeats, and put back healthy ones
         $num = $this->channel->length();
@@ -420,7 +478,6 @@ class Pool implements PoolInterface
 
             if ($elapsed < $this->heartbeatInterval) {
                 $this->channel->push($connection);
-                $checked[] = $connection;
                 continue;
             }
 

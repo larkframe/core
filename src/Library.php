@@ -13,7 +13,7 @@ class Library
             $configPath = config_path() . '/';
             if (file_exists($configPath . $childClassName . '.php')) {
                 $config = require $configPath . $childClassName . '.php';
-                if (is_array($config) && file_exists($configPath . $childClassName . '.' . RUN_MODE . '.php')) {
+                if (is_array($config) && defined('RUN_MODE') && file_exists($configPath . $childClassName . '.' . RUN_MODE . '.php')) {
                     $envConfig = require $configPath . $childClassName . '.' . RUN_MODE . '.php';
                     if (is_array($envConfig)) {
                         $config = array_merge($config, $envConfig);

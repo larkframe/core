@@ -43,9 +43,19 @@ class App
     protected static array $callbacks = [];
 
     /**
-     * Ordered keys for LRU eviction (oldest first).
+     * Doubly-linked list nodes for O(1) LRU eviction: key => ['prev' => ?string, 'next' => ?string].
      */
-    protected static array $callbackKeys = [];
+    protected static array $lruNodes = [];
+
+    /**
+     * LRU head (oldest entry).
+     */
+    protected static ?string $lruHead = null;
+
+    /**
+     * LRU tail (most recently used entry).
+     */
+    protected static ?string $lruTail = null;
 
     /**
      * Maximum callback cache size.
@@ -92,13 +102,8 @@ class App
             $key = $request->method() . $path;
 
             if (isset(static::$callbacks[$key])) {
-                // Move to end of LRU (most recently used)
-                $idx = array_search($key, static::$callbackKeys, true);
-                if ($idx !== false) {
-                    unset(static::$callbackKeys[$idx]);
-                    static::$callbackKeys = array_values(static::$callbackKeys);
-                    static::$callbackKeys[] = $key;
-                }
+                // Move to end of LRU (most recently used) — O(1) via doubly-linked list
+                static::lruTouch($key);
                 [$callback, $controller, $action, $route] = static::$callbacks[$key];
                 $request->setController($controller);
                 $request->setAction($action);
@@ -133,30 +138,81 @@ class App
     }
 
     /**
-     * Collect route callbacks with proper LRU eviction.
-     * Uses a linked-list approach for O(1) eviction instead of array_values rebuild.
+     * Collect route callbacks with O(1) LRU eviction via doubly-linked list.
      */
     protected static function collectCallbacks(string $key, array $data): void
     {
-        // If key already exists, move it to the end (most recently used)
-        if (isset(static::$callbacks[$key])) {
-            $idx = array_search($key, static::$callbackKeys, true);
-            if ($idx !== false) {
-                unset(static::$callbackKeys[$idx]);
-                static::$callbackKeys = array_values(static::$callbackKeys);
-            }
-            static::$callbackKeys[] = $key;
-        } else {
-            static::$callbackKeys[] = $key;
-
+        if (!isset(static::$callbacks[$key])) {
             // Evict oldest entries if over limit
             while (count(static::$callbacks) >= static::$maxCallbackCache) {
-                $oldestKey = array_shift(static::$callbackKeys);
-                unset(static::$callbacks[$oldestKey]);
+                $evictedKey = static::lruEvict();
+                if ($evictedKey === null) {
+                    break;
+                }
+                unset(static::$callbacks[$evictedKey]);
             }
         }
 
+        static::lruTouch($key);
         static::$callbacks[$key] = $data;
+    }
+
+    /**
+     * Move key to LRU tail (most recently used). O(1).
+     */
+    protected static function lruTouch(string $key): void
+    {
+        if (isset(static::$lruNodes[$key])) {
+            static::lruDetach($key);
+        }
+        static::lruAttachTail($key);
+    }
+
+    /**
+     * Detach a node from the LRU list. O(1).
+     */
+    protected static function lruDetach(string $key): void
+    {
+        $node = static::$lruNodes[$key];
+        if ($node['prev'] !== null) {
+            static::$lruNodes[$node['prev']]['next'] = $node['next'];
+        } else {
+            static::$lruHead = $node['next'];
+        }
+        if ($node['next'] !== null) {
+            static::$lruNodes[$node['next']]['prev'] = $node['prev'];
+        } else {
+            static::$lruTail = $node['prev'];
+        }
+    }
+
+    /**
+     * Attach key to LRU tail. O(1).
+     */
+    protected static function lruAttachTail(string $key): void
+    {
+        static::$lruNodes[$key] = ['prev' => static::$lruTail, 'next' => null];
+        if (static::$lruTail !== null) {
+            static::$lruNodes[static::$lruTail]['next'] = $key;
+        }
+        static::$lruTail = $key;
+        if (static::$lruHead === null) {
+            static::$lruHead = $key;
+        }
+    }
+
+    /**
+     * Evict the oldest key from LRU head. O(1).
+     */
+    protected static function lruEvict(): ?string
+    {
+        if (static::$lruHead === null) {
+            return null;
+        }
+        $evictKey = static::$lruHead;
+        static::lruDetach($evictKey);
+        unset(static::$lruNodes[$evictKey]);
+        return $evictKey;
     }
 
     /**
@@ -239,7 +295,7 @@ HTML;
      */
     protected static function exceptionResponse(Throwable $e, mixed $request): Response
     {
-        $response = new \LarkFrame\Response(500, [], static::config('app.debug', true) ? (string)$e : $e->getMessage());
+        $response = new \LarkFrame\Response(500, [], static::config('app.debug', false) ? (string)$e : $e->getMessage());
         $response->exception($e);
         return $response;
     }
@@ -358,7 +414,16 @@ HTML;
             return true;
         }
 
-        $status = $routeInfo[0] === Dispatcher::METHOD_NOT_ALLOWED ? 405 : 404;
+        // P2-25：METHOD_NOT_ALLOWED 时直接发送 405 + Allow 头（FastRoute 已自动映射 GET→HEAD，
+        // OPTIONS 命中此处并返回所有注册方法），避免之前 405 被误当 404 发送
+        if ($routeInfo[0] === Dispatcher::METHOD_NOT_ALLOWED) {
+            $allowedMethods = is_array($routeInfo[1] ?? null) ? $routeInfo[1] : [];
+            $allowHeader = ['Allow' => implode(', ', $allowedMethods)];
+            $response = new \LarkFrame\Response(405, $allowHeader, '405 Method Not Allowed');
+            static::send($connection, $response, $request);
+            return true;
+        }
+
         return false;
     }
 
@@ -524,14 +589,20 @@ HTML;
             case \LarkFrame\Consts::RUN_TYPE_WEB:
                 $response = static::runAsNormal();
                 if ($response instanceof Response) {
-                    http_response_code($response->getStatusCode());
-                    foreach ($response->getHeaders() as $name => $value) {
-                        if (strtolower($name) === 'server' || strtolower($name) === 'connection' || strtolower($name) === 'content-length') {
-                            continue;
+                    if ($response->file !== null) {
+                        // 文件响应：通过 __toString 触发 WebSender 输出 headers + 文件正文
+                        // WebSender::formatFileResponse 内部调用 http_response_code() + header() + readfile()
+                        echo $response;
+                    } else {
+                        http_response_code($response->getStatusCode());
+                        foreach ($response->getHeaders() as $name => $value) {
+                            if (strtolower($name) === 'server' || strtolower($name) === 'connection' || strtolower($name) === 'content-length') {
+                                continue;
+                            }
+                            header("$name: $value");
                         }
-                        header("$name: $value");
+                        echo $response->rawBody();
                     }
-                    echo $response->rawBody();
                 } else {
                     echo $response;
                 }
@@ -579,11 +650,12 @@ HTML;
             });
 
             if ($worker) {
-                register_shutdown_function(function ($startTime) {
-                    if (time() - $startTime <= 0.1) {
+                // 用 microtime(true) 获取浮点秒，否则 time() 整数秒差值恒为整数，<= 0.1 等价于 <= 0
+                register_shutdown_function(function (float $startTime) {
+                    if (microtime(true) - $startTime <= 0.1) {
                         sleep(1);
                     }
-                }, time());
+                }, microtime(true));
             }
 
             Config::clear();
@@ -608,8 +680,8 @@ HTML;
         if (in_array(RUN_TYPE, [$consts::RUN_TYPE_SHELL, $consts::RUN_TYPE_WEB])) {
             if (RUN_TYPE == $consts::RUN_TYPE_WEB) {
                 $method = strtoupper($_SERVER['REQUEST_METHOD']);
-                $queryString = $_SERVER['QUERY_STRING'] ?? '';
-                $route = str_replace($queryString, "", $_SERVER['REQUEST_URI']);
+                // 用 parse_url 提取 path，避免 str_replace 替换 URI 中所有匹配位置导致路径破坏
+                $route = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?? '/';
                 if (str_ends_with($route, "/") || str_ends_with($route, "?")) {
                     $route = substr($route, 0, strlen($route) - 1);
                 }

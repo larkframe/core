@@ -52,6 +52,8 @@ class ViewVarHolder
     public static function clear(): void
     {
         static::saveVars([]);
+        // P2-47：同时清理 static fallback，防止 server 模式下 Fiber 外写入的变量跨请求泄漏
+        self::$vars = [];
     }
 
     /**

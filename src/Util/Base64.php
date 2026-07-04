@@ -41,11 +41,16 @@ class Base64
     }
 
     /**
-     * 带过期时间的可逆加密/解密
+     * 带过期时间的可逆编码（非加密）。
      *
-     * @param string $string 要加密/解密的字符串
+     * P2-18 警告：本方法本质是 RC4 + MD5 签名的可逆混淆，**不是密码学安全的加密**。
+     * 仅用于不敏感数据（如 cookie token、临时链接）的防篡改传输，
+     * 严禁用于密码、密钥、支付凭证等敏感数据存储。敏感数据请使用 password_hash
+     * 或 sodium_crypto_aead_aes256gcm_encrypt。
+     *
+     * @param string $string 要编码/解码的字符串
      * @param string $operation 'ENCODE' 或 'DECODE'
-     * @param string $key 加密密钥
+     * @param string $key 编码密钥
      * @param int $expiry 密文有效期(秒)，0 为永久有效
      * @return string|false 处理后的字符串或失败时返回 false
      */
@@ -96,7 +101,7 @@ class Base64
         $md5Check = substr($decrypted, 4, 16);
         $result = substr($decrypted, 20);
 
-        if (substr(md5($result . $keyb), 0, 16) !== $md5Check) {
+        if (!hash_equals(substr(md5($result . $keyb), 0, 16), $md5Check)) {
             return false;
         }
 
@@ -105,6 +110,20 @@ class Base64
         }
 
         return $result;
+    }
+
+    /**
+     * 常量时间字符串比较（P2-41 方案 A）。
+     *
+     * 用于 HMAC 签名校验、token 比较等场景，避免时序攻击推断签名。
+     * 普通字符串相等比较仍应使用 ===，仅在比较敏感凭证时使用本方法。
+     */
+    public static function verify(string $known, string $userInput): bool
+    {
+        if (strlen($known) !== strlen($userInput)) {
+            return false;
+        }
+        return hash_equals($known, $userInput);
     }
 
     /**

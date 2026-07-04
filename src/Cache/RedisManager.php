@@ -38,13 +38,8 @@ class RedisManager extends \Illuminate\Redis\RedisManager
 
         if (!$connection) {
             static::$pools[$name] ??= $this->createPool($name);
-            try {
-                $connection = static::$pools[$name]->get();
-                Context::set($key, $connection);
-            } catch (Throwable $e) {
-                // Connection was never obtained, nothing to return to pool
-                throw $e;
-            }
+            $connection = static::$pools[$name]->get();
+            Context::set($key, $connection);
             Context::onDestroy(function () use ($connection, $name): void {
                 try {
                     static::$pools[$name]->put($connection);
@@ -74,7 +69,7 @@ class RedisManager extends \Illuminate\Redis\RedisManager
             return $connection;
         });
         $pool->setConnectionCloser(fn(Connection $connection): bool => $connection->client()->close());
-        $pool->setHeartbeatChecker(fn(Connection $connection): mixed => $connection->get('PING'));
+        $pool->setHeartbeatChecker(fn(Connection $connection): mixed => $connection->client()->ping());
         return $pool;
     }
 

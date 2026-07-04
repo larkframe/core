@@ -24,17 +24,21 @@ class ShellSource implements RequestSourceInterface
         $requestId = strtolower(substr(md5(microtime() . uniqid(gethostname() . '_', true)), 8, 16) . Rand::str(16));
         $startTime = microtime(true);
 
+        $route = defined('ROUTE_VALUE') ? ROUTE_VALUE : '/';
         $shellParams = [];
         if (isset($_SERVER['argv'][2])) {
             parse_str($_SERVER['argv'][2], $shellParams);
-            $uri = ROUTE_VALUE . '?' . $_SERVER['argv'][2];
+            $uri = $route . '?' . $_SERVER['argv'][2];
         } else {
-            $uri = ROUTE_VALUE;
+            $uri = $route;
         }
 
         $data['get'] = $shellParams;
         $data['post'] = $shellParams;
         $data['uri'] = $uri;
+        $data['method'] = 'CLI';
+        $data['headers'] = [];
+        $data['cookie'] = [];
         $data['requestId'] = $requestId;
         $data['startTime'] = $startTime;
     }

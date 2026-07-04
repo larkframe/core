@@ -65,6 +65,11 @@ interface EventInterface
     public function deleteAllTimer(): void;
 
     /**
+     * Remove all event listeners (readable, writable, signal) and timers without stopping the loop.
+     */
+    public function offAll(): void;
+
+    /**
      * Run the event loop.
      */
     public function run(): void;

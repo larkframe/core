@@ -54,6 +54,7 @@ class Config
 
         $env = [];
         $inQuote = false;
+        $quoteChar = '';
         $currentKey = null;
         $currentValue = '';
 
@@ -63,9 +64,13 @@ class Config
             }
 
             if ($inQuote) {
-                if (preg_match('/(?<![\\\\])([\'"])\s*$/', $line, $matches)) {
+                // 闭合检测必须与开启引号类型一致，否则 KEY="abc' 会被误判为闭合
+                $escaped = preg_quote($quoteChar, '/');
+                if (preg_match('/(?<![\\\\])' . $escaped . '\s*$/', $line, $matches)) {
                     $inQuote = false;
-                    $currentValue .= "\n" . substr($line, 0, -strlen($matches[0]));
+                    // 截取到最后一个匹配引号的位置
+                    $pos = strrpos($line, $quoteChar);
+                    $currentValue .= "\n" . substr($line, 0, $pos);
                 } else {
                     $currentValue .= "\n" . $line;
                     continue;
@@ -120,6 +125,14 @@ class Config
         return $env;
 
     }
+    /**
+     * 清理中央配置缓存。
+     *
+     * P2-24 注意：本方法仅清理 Config 类的静态缓存，不清理 Library 子类实例持有的
+     * $config 副本（Library 在构造时按需加载并缓存到实例属性）。如需完整热重载，
+     * 调用方应重新实例化 Library 子类或重启 worker。跨类全局注册表会增加耦合，
+     * 不符合"少即是多"原则，故不在此实现。
+     */
     public static function clear()
     {
         static::$config = [];

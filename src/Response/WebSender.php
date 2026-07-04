@@ -3,6 +3,7 @@
 namespace LarkFrame\Response;
 
 use function explode;
+use function flush;
 use function header;
 use function http_response_code;
 use function rawurlencode;
@@ -48,10 +49,34 @@ class WebSender implements ResponseSenderInterface
         return $body;
     }
 
-    public function formatFileResponse(int $status, string $version, ?string $reason, array $headers): string
+    public function formatFileResponse(int $status, string $version, ?string $reason, array $headers, ?array $file = null): string
     {
         http_response_code($status);
         $this->sendHeaders($headers);
+        // FPM 模式必须显式输出文件正文，否则下载响应体为空
+        if ($file !== null && isset($file['file']) && is_file($file['file'])) {
+            $offset = $file['offset'] ?? 0;
+            $length = $file['length'] ?? 0;
+            if ($length > 0) {
+                $fp = fopen($file['file'], 'rb');
+                if ($fp !== false) {
+                    fseek($fp, $offset);
+                    echo stream_get_contents($fp, $length);
+                    fclose($fp);
+                }
+            } elseif ($offset > 0) {
+                $fp = fopen($file['file'], 'rb');
+                if ($fp !== false) {
+                    fseek($fp, $offset);
+                    fpassthru($fp);
+                    fclose($fp);
+                }
+            } else {
+                readfile($file['file']);
+            }
+        }
+        // P2-40：主动刷新输出缓冲，确保大文件下载内容及时推送到客户端
+        flush();
         return '';
     }
 

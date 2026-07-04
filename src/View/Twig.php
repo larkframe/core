@@ -39,7 +39,16 @@ class Twig implements View
             return "template " . $template . "." . $viewSuffix . " not found";
         }
         if (!isset($views[$viewPath])) {
-            $views[$viewPath] = new Environment(new FilesystemLoader($viewPath), config("view.options", []));
+            $options = config("view.options", []);
+            // P2-46：未显式配置 cache 时默认开启模板编译缓存，避免每次请求重新编译
+            if (!array_key_exists('cache', $options)) {
+                $cacheDir = ROOT_PATH . DIRECTORY_SEPARATOR . 'runtime' . DIRECTORY_SEPARATOR . 'twig_cache';
+                if (!is_dir($cacheDir) && !mkdir($cacheDir, 0755, true) && !is_dir($cacheDir)) {
+                    throw new \RuntimeException("Cannot create Twig cache directory: {$cacheDir}");
+                }
+                $options['cache'] = $cacheDir;
+            }
+            $views[$viewPath] = new Environment(new FilesystemLoader($viewPath), $options);
             $extension = config("view.extension");
             if ($extension) {
                 $extension($views[$viewPath]);

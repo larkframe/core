@@ -83,7 +83,7 @@ use Throwable;
  * @method static false|int lPush($key, ...$entries)
  * @method static false|int lPushx($key, $value)
  * @method static array lRange($key, $start, $end)
- * @method static false|int lRem($key, $count, $value)
+ * @method static false|int lRem($key, $value, $count = 0)
  * @method static bool lSet($key, $index, $value)
  * @method static false|array lTrim($key, $start, $end)
  * @method static false|string rPop($key)
@@ -215,6 +215,9 @@ class Redis
     {
         if (!static::$instance) {
             $config = config('redis');
+            if (!is_array($config)) {
+                throw new \RuntimeException('Redis config is not configured. Please check config/redis.php');
+            }
             $client = $config['client'] ?? self::PHPREDIS_CLIENT;
 
             if (!in_array($client, self::ALLOWED_CLIENTS, true)) {
@@ -246,7 +249,10 @@ class Redis
 
         // Dynamically register the connection config if not already present
         if (!isset(static::$config[$connectionName])) {
-            $base = static::$config[$name] ?? [];
+            $base = static::$config[$name] ?? null;
+            if ($base === null) {
+                throw new \InvalidArgumentException("Redis connection '{$name}' is not configured.");
+            }
             static::$config[$connectionName] = array_merge($base, ['database' => $database]);
             $manager->addConnectionConfig($connectionName, static::$config[$connectionName]);
         }

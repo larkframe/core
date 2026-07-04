@@ -10,7 +10,8 @@ class Job
     public function __construct(
         protected QueueInterface $queue,
         protected string $queueName,
-        protected array $payload
+        protected array $payload,
+        protected ?string $rawPayload = null
     ) {}
 
     /**
@@ -63,10 +64,11 @@ class Job
 
     /**
      * 获取原始 JSON payload
+     * 优先返回构造时传入的 rawPayload（Lua cjson.encode 产物），保证与 reserved ZSET 成员精确匹配
      */
     public function getRawPayload(): string
     {
-        return json_encode($this->payload);
+        return $this->rawPayload ?? json_encode($this->payload, JSON_THROW_ON_ERROR);
     }
 
     /**
@@ -116,9 +118,9 @@ class Job
 
         // If job is a serialized closure or object
         if (!class_exists($job)) {
-            $instance = @unserialize($job);
-            if ($instance === false) {
-                throw new \RuntimeException("Unable to unserialize job: $job");
+            $instance = unserialize($job, ['allowed_classes' => true]);
+            if ($instance === false && $job !== 'b:0;') {
+                throw new \RuntimeException("Unable to unserialize job");
             }
             if (is_callable($instance)) {
                 return $instance($this);

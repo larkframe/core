@@ -19,6 +19,10 @@ use function uniqid;
  *
  * Request source for traditional PHP-FPM/Web mode.
  * Data is populated from PHP superglobals.
+ *
+ * P2-38：php://input 通过 file_get_contents 一次性读入内存。FPM 模式下受
+ * php.ini post_max_size 限制，超大 body 由 PHP 层截断。流式读取属于新功能，
+ * 当前不实现，依赖 post_max_size 兜底。
  */
 class WebSource implements RequestSourceInterface
 {

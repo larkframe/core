@@ -32,6 +32,10 @@ use function trim;
  *
  * HTTP protocol implementation for parsing HTTP requests and encoding HTTP responses.
  * Optimized for PHP 8.1 with readonly properties, match expressions, and named arguments.
+ *
+ * P2-36：HTTP/2 不在本类直接支持范围内。HTTP/2 的多路复用、HPACK 头压缩、服务端推送
+ * 需要连接级状态管理，与当前 HTTP/1.1 逐请求解析模型不兼容。生产环境应通过 nginx/h2o
+ * 等 reverse proxy 终结 HTTP/2 连接后以 HTTP/1.1 转发至本服务。
  */
 class Http
 {
@@ -277,7 +281,7 @@ class Http
     protected static function decodeChunked(string $buffer, int $headerEnd): array
     {
         $header = preg_replace('~\r\nTransfer-Encoding[ \t]*:[^\r]*~i', '', substr($buffer, 0, $headerEnd), 1);
-        $body = '';
+        $parts = [];
         $trailers = [];
         $pos = $headerEnd + 4;
         $bufLen = strlen($buffer);
@@ -326,10 +330,11 @@ class Http
             if (substr($buffer, $pos + $chunkSize, 2) !== "\r\n") {
                 break;
             }
-            $body .= substr($buffer, $pos, $chunkSize);
+            $parts[] = substr($buffer, $pos, $chunkSize);
             $pos += $chunkSize + 2;
         }
 
+        $body = implode('', $parts);
         return [$header . "\r\nContent-Length: " . strlen($body) . "\r\n\r\n" . $body, $trailers];
     }
 
@@ -443,6 +448,7 @@ class Http
                     $remainSize = $offsetEnd - $tell;
                     if ($remainSize <= 0) {
                         fclose($handler);
+                        $connection->onBufferFull = null;
                         $connection->onBufferDrain = null;
                         return;
                     }
@@ -452,6 +458,7 @@ class Http
                 $buffer = fread($handler, $size);
                 if ($buffer === '' || $buffer === false) {
                     fclose($handler);
+                    $connection->onBufferFull = null;
                     $connection->onBufferDrain = null;
                     $connection->context->streamSending = false;
                     return;

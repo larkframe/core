@@ -54,10 +54,18 @@ class DatabaseManager extends BaseDatabaseManager
                 throw $e;
             }
             Context::onDestroy(function () use ($connection, $name): void {
+                $pool = static::$pools[$name] ?? null;
+                if ($pool === null) {
+                    return;
+                }
                 try {
-                    static::$pools[$name]->put($connection);
+                    // Roll back uncommitted transactions to prevent dirty state leaking to next request
+                    if (method_exists($connection, 'transactionLevel') && $connection->transactionLevel() > 0) {
+                        $connection->rollBack();
+                    }
+                    $pool->put($connection);
                 } catch (Throwable) {
-                    // ignore
+                    // ignore — connection may already be closed
                 }
             });
         }

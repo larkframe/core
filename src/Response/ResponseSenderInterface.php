@@ -36,7 +36,13 @@ interface ResponseSenderInterface
     /**
      * Format file response headers.
      * For server mode: returns the full header string.
-     * For FPM mode: sends headers via header() and returns empty string.
+     * For FPM mode: sends headers via header() and outputs file content, returns empty string.
+     *
+     * @param int $status
+     * @param string $version
+     * @param string|null $reason
+     * @param array $headers
+     * @param array|null $file File info ['file' => path, 'offset' => int, 'length' => int]; null in server mode
      */
-    public function formatFileResponse(int $status, string $version, ?string $reason, array $headers): string;
+    public function formatFileResponse(int $status, string $version, ?string $reason, array $headers, ?array $file = null): string;
 }

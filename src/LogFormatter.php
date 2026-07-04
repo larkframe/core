@@ -19,6 +19,8 @@ class LogFormatter extends NormalizerFormatter
     protected $includeStacktraces;
     /** @var ?callable */
     protected $stacktracesParser;
+    /** @var bool */
+    protected bool $stripAnsi = true;
 
     /**
      * @param string|null $format The format of the message
@@ -56,6 +58,17 @@ class LogFormatter extends NormalizerFormatter
     public function ignoreEmptyContextAndExtra(bool $ignore = true): self
     {
         $this->ignoreEmptyContextAndExtra = $ignore;
+
+        return $this;
+    }
+
+    /**
+     * P2-49：是否剥离 ANSI 颜色码。文件日志应设为 true（默认），
+     * 终端输出可设为 false 以保留彩色。
+     */
+    public function stripAnsi(bool $strip = true): self
+    {
+        $this->stripAnsi = $strip;
 
         return $this;
     }
@@ -140,6 +153,11 @@ class LogFormatter extends NormalizerFormatter
             '%run_type%' => defined('RUN_TYPE') ? RUN_TYPE : '',
         ];
         $output = str_replace(array_keys($replacements), array_values($replacements), $output);
+
+        // P2-49：剥离 ANSI 颜色码，防止终端色码泄漏到文件日志
+        if ($this->stripAnsi) {
+            $output = preg_replace('/\x1b\[[0-9;]*[a-zA-Z]/', '', $output);
+        }
 
         return $output;
     }

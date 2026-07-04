@@ -78,6 +78,11 @@ class Route
 
     public static function shell(string $path, $callback): RouteDefinition
     {
+        // P2-12：Shell 模式 dispatch 会自动补 '/'，注册侧统一确保 leading '/'，
+        // 使 Route::shell('migrate') 与 Route::shell('/migrate') 都能匹配
+        if ($path !== '' && !str_starts_with($path, '/')) {
+            $path = '/' . $path;
+        }
         return static::addRoute('SHELL', $path, $callback);
     }
 
@@ -246,6 +251,9 @@ class Route
      */
     public static function dispatch(string $method, string $path): array
     {
+        if (static::$dispatcher === null) {
+            throw new \RuntimeException('Route dispatcher is not initialized. Call Route::load() first.');
+        }
         return static::$dispatcher->dispatch($method, $path);
     }
 
@@ -332,7 +340,7 @@ class Route
             Route::setCollector($route);
             $routeConfigFile = ROOT_PATH . '/config/route.php';
             if (is_file($routeConfigFile)) {
-                require_once $routeConfigFile;
+                require $routeConfigFile;
             }
         });
     }

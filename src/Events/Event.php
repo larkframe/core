@@ -65,9 +65,17 @@ class Event implements EventInterface
 
     /**
      * Constructor.
+     *
+     * P2-34：ext-event 未加载时抛出明确异常，避免实例化时因 \EventBase 类不存在产生晦涩错误。
+     * 调用方应捕获此异常并回退到 Select 实现。
      */
     public function __construct()
     {
+        if (!extension_loaded('event')) {
+            throw new \RuntimeException(
+                'ext-event extension is not loaded. Use LarkFrame\Events\Select as fallback.'
+            );
+        }
         $this->eventBase = new \EventBase();
     }
 
@@ -260,15 +268,7 @@ class Event implements EventInterface
     /**
      * @inheritDoc
      */
-    public function run(): void
-    {
-        $this->eventBase->loop();
-    }
-
-    /**
-     * @inheritDoc
-     */
-    public function stop(): void
+    public function offAll(): void
     {
         $this->deleteAllTimer();
 
@@ -286,7 +286,22 @@ class Event implements EventInterface
             $event->free();
         }
         $this->writeEvents = [];
+    }
 
+    /**
+     * @inheritDoc
+     */
+    public function run(): void
+    {
+        $this->eventBase->loop();
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function stop(): void
+    {
+        $this->offAll();
         $this->eventBase->stop();
     }
 

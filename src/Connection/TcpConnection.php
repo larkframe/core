@@ -3,6 +3,7 @@
 namespace LarkFrame\Connection;
 
 use LarkFrame\Events\EventInterface;
+use LarkFrame\Worker;
 use RuntimeException;
 use stdClass;
 use Throwable;
@@ -27,6 +28,10 @@ use const STREAM_SHUT_WR;
  * TCP connection implementation for the server mode.
  * Optimized for PHP 8.1 with enum-based status, readonly properties,
  * first-class callable syntax, and match expressions.
+ *
+ * P2-29 说明：SSL/TLS 握手由 Worker::listen 在监听层通过 stream_context_create
+ * 的 ssl 选项完成（https/wss → ssl 传输层），本类接收的 $socket 已是完成握手的
+ * 加密连接，无需在 TcpConnection 内调用 stream_socket_enable_crypto。
  */
 class TcpConnection
 {
@@ -301,6 +306,7 @@ class TcpConnection
                 $sendBuffer = $this->protocol::encode($sendBuffer, $this);
             } catch (Throwable $e) {
                 $this->error($e);
+                return false;
             }
             if ($sendBuffer === '') {
                 return null;
@@ -458,11 +464,16 @@ class TcpConnection
      */
     public function resumeRecv(): void
     {
-        if ($this->isPaused === true) {
-            $this->eventLoop?->onReadable($this->socket, $this->baseRead(...));
-            $this->isPaused = false;
-            $this->baseRead($this->socket, false);
+        if ($this->isPaused !== true) {
+            return;
         }
+        $socket = $this->socket;
+        if ($socket === null) {
+            return;
+        }
+        $this->eventLoop?->onReadable($socket, $this->baseRead(...));
+        $this->isPaused = false;
+        $this->baseRead($socket, false);
     }
 
     /**
@@ -728,7 +739,7 @@ class TcpConnection
             try {
                 ($this->onError)($this, self::SEND_FAIL, $exception->getMessage());
             } catch (Throwable $e) {
-                // Prevent infinite recursion in error handler
+                Worker::log("Error handler exception: " . $e->getMessage());
             }
         }
     }

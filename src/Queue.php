@@ -52,6 +52,10 @@ class Queue
     {
         if (static::$instance === null) {
             $config = config('queue', []);
+            $driver = $config['driver'] ?? 'redis';
+            if ($driver !== 'redis') {
+                throw new \RuntimeException("Queue driver '{$driver}' is not supported. Only 'redis' is implemented.");
+            }
             static::$instance = new RedisQueue($config);
         }
         return static::$instance;

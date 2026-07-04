@@ -81,6 +81,16 @@ class Worker
     public const DEFAULT_BACKLOG = 102400;
 
     /**
+     * Log buffer flush threshold in bytes.
+     */
+    private const LOG_FLUSH_THRESHOLD = 65536;
+
+    /**
+     * Log rotation check interval in seconds.
+     */
+    private const ROTATE_CHECK_INTERVAL = 60;
+
+    /**
      * Worker id.
      */
     public int $id = 0;
@@ -205,6 +215,13 @@ class Worker
     public static int $logFileMaxSize = 10_485_760;
 
     /**
+     * Log buffer for batch writing to reduce I/O blocking.
+     */
+    private static array $logBuffer = [];
+    private static int $logBufferSize = 0;
+    private static int $lastRotateCheck = 0;
+
+    /**
      * Global event loop.
      */
     public static ?EventInterface $globalEvent = null;
@@ -279,6 +296,11 @@ class Worker
     protected static array $pidMap = [];
 
     /**
+     * Worker process start times for crash-loop backoff (pid => timestamp).
+     */
+    protected static array $workerStartTime = [];
+
+    /**
      * Current status.
      */
     protected static int $status = self::STATUS_INITIAL;
@@ -309,9 +331,7 @@ class Worker
             $this->socketContext = stream_context_create($socketContext);
         }
 
-        $this->onMessage = static function (): void {
-            // Empty.
-        };
+        $this->onMessage = null;
     }
 
     /**
@@ -524,6 +544,11 @@ class Worker
             chmod(static::$logFile, 0644);
         }
 
+        // Ensure log buffer is flushed on shutdown to prevent log loss
+        register_shutdown_function(static function (): void {
+            static::flushLog();
+        });
+
         static::$status = static::STATUS_STARTING;
         static::initGlobalEvent();
 
@@ -647,8 +672,12 @@ class Worker
         if ($this->socketName && !str_contains($this->socketName, '://')) {
             $this->socketName = 'tcp://' . $this->socketName;
         }
-        // Default to HTTP protocol.
-        $this->protocol = Protocols\Http::class;
+        $scheme = parse_url($this->socketName, PHP_URL_SCHEME);
+        $this->protocol = match ($scheme) {
+            'ws', 'wss' => throw new \RuntimeException("Websocket protocol not implemented for socket '{$this->socketName}'"),
+            'tcp', 'http', 'https', 'ssl', 'tls', null => Protocols\Http::class,
+            default => Protocols\Http::class,
+        };
     }
 
     /**
@@ -726,6 +755,7 @@ class Worker
         if ($pid > 0) {
             // Master process.
             static::$pidMap[$worker->workerId][$pid] = $pid;
+            static::$workerStartTime[$pid] = time();
             return;
         }
         // Worker process.
@@ -778,7 +808,14 @@ class Worker
                 foreach (static::$workers as $worker) {
                     if (isset(static::$pidMap[$worker->workerId][$pid])) {
                         unset(static::$pidMap[$worker->workerId][$pid]);
+                        // Crash-loop backoff: if worker exited too quickly, delay restart
+                        $startTime = static::$workerStartTime[$pid] ?? null;
+                        unset(static::$workerStartTime[$pid]);
                         if (static::$status !== static::STATUS_SHUTDOWN) {
+                            if ($startTime !== null && (time() - $startTime) < 5) {
+                                static::log("Worker (pid={$pid}) exited too quickly, delaying restart by 2s");
+                                sleep(2);
+                            }
                             // Restart the worker.
                             static::forkOneWorker($worker);
                         }
@@ -825,7 +862,12 @@ class Worker
         }
 
         // onWorkerStart callback.
-        $this->onWorkerStart?->__invoke($this);
+        try {
+            $this->onWorkerStart?->__invoke($this);
+        } catch (Throwable $e) {
+            static::log("onWorkerStart error: " . $e);
+            throw $e;
+        }
 
         // Run event loop.
         static::$globalEvent->run();
@@ -841,9 +883,18 @@ class Worker
         }
 
         $socketName = $this->socketName;
-        // Parse the socket name.
-        if (str_starts_with($socketName, 'http://')) {
-            $socketName = 'tcp://' . substr($socketName, 7);
+        // Map application-level schemes to transport-level schemes
+        $schemeMap = [
+            'http://' => 'tcp://',
+            'https://' => 'ssl://',
+            'ws://' => 'tcp://',
+            'wss://' => 'ssl://',
+        ];
+        foreach ($schemeMap as $from => $to) {
+            if (str_starts_with($socketName, $from)) {
+                $socketName = $to . substr($socketName, strlen($from));
+                break;
+            }
         }
 
         // Create socket.
@@ -864,6 +915,10 @@ class Worker
      */
     protected function acceptConnection(mixed $socket): void
     {
+        if ($this->onMessage === null) {
+            throw new \RuntimeException('Worker onMessage callback not set');
+        }
+
         $newSocket = @stream_socket_accept($socket, 0, $remoteAddress);
         if (!$newSocket) {
             return;
@@ -872,8 +927,15 @@ class Worker
         $connection = new TcpConnection(static::$globalEvent, $newSocket, $remoteAddress);
         $connection->protocol = $this->protocol;
         $connection->onMessage = $this->onMessage;
-        $connection->onClose = $this->onClose;
         $connection->onError = $this->onError;
+        // Wrap onClose to remove from $this->connections, preventing memory leak
+        $userOnClose = $this->onClose;
+        $connection->onClose = function (TcpConnection $conn) use ($userOnClose) {
+            unset($this->connections[$conn->id]);
+            if ($userOnClose !== null) {
+                $userOnClose($conn);
+            }
+        };
         $this->connections[$connection->id] = $connection;
 
         $this->onConnect?->__invoke($connection);
@@ -893,6 +955,9 @@ class Worker
 
         if (DIRECTORY_SEPARATOR === '/' && static::$masterPid === posix_getpid()) {
             // Master process: send SIGINT to all workers.
+            if (static::$onMasterStop !== null) {
+                (static::$onMasterStop)();
+            }
             foreach (static::$pidMap as $pids) {
                 foreach ($pids as $pid) {
                     posix_kill($pid, SIGINT);
@@ -965,7 +1030,14 @@ class Worker
      */
     protected static function reloadWorkers(): void
     {
-        foreach (static::$pidMap as $pids) {
+        if (static::$onMasterReload !== null) {
+            (static::$onMasterReload)();
+        }
+        foreach (static::$pidMap as $workerId => $pids) {
+            $worker = static::$workers[$workerId] ?? null;
+            if ($worker !== null && !$worker->reloadable) {
+                continue;
+            }
             foreach ($pids as $pid) {
                 posix_kill($pid, SIGINT);
             }
@@ -992,24 +1064,62 @@ class Worker
     }
 
     /**
-     * Log a message.
+     * Log a message (buffered, flushed on threshold or shutdown).
      */
     public static function log(string|Throwable $message): void
     {
         $message = (string)$message;
-        if (static::$logFile && static::$logFile !== '/dev/null') {
-            $dir = dirname(static::$logFile);
-            if (!is_dir($dir)) {
-                mkdir($dir, 0777, true);
-            }
-            // Rotate log file if it exceeds max size
-            if (is_file(static::$logFile) && filesize(static::$logFile) > static::$logFileMaxSize) {
-                $rotatedFile = static::$logFile . '.' . date('Y-m-d-His');
-                @rename(static::$logFile, $rotatedFile);
-            }
-            file_put_contents(static::$logFile, date('Y-m-d H:i:s') . ' ' . $message . "\n", FILE_APPEND | LOCK_EX);
+        if (static::$logFile === '' || static::$logFile === '/dev/null') {
+            static::safeEcho($message);
+            return;
         }
+
+        $line = date('Y-m-d H:i:s') . ' ' . $message . "\n";
+        static::$logBuffer[] = $line;
+        static::$logBufferSize += strlen($line);
+
+        if (static::$logBufferSize >= self::LOG_FLUSH_THRESHOLD) {
+            static::flushLog();
+        }
+
         static::safeEcho($message);
+    }
+
+    /**
+     * Flush buffered log entries to file with rotation check.
+     */
+    private static function flushLog(): void
+    {
+        if (empty(static::$logBuffer)) {
+            return;
+        }
+
+        $now = time();
+        if ($now - static::$lastRotateCheck >= self::ROTATE_CHECK_INTERVAL) {
+            static::checkLogRotation();
+            static::$lastRotateCheck = $now;
+        }
+
+        $dir = dirname(static::$logFile);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0777, true);
+        }
+
+        file_put_contents(static::$logFile, implode('', static::$logBuffer), FILE_APPEND | LOCK_EX);
+        static::$logBuffer = [];
+        static::$logBufferSize = 0;
+    }
+
+    /**
+     * Check and perform log rotation if file exceeds max size.
+     */
+    private static function checkLogRotation(): void
+    {
+        if (!is_file(static::$logFile) || filesize(static::$logFile) <= static::$logFileMaxSize) {
+            return;
+        }
+        $rotatedFile = static::$logFile . '.' . date('Y-m-d-His');
+        @rename(static::$logFile, $rotatedFile);
     }
 
     /**

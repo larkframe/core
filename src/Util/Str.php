@@ -5,17 +5,17 @@ namespace LarkFrame\Util;
 class Str
 {
     /**
-     * 驼峰转下划线
+     * 驼峰转下划线。
+     *
+     * P2-44 方案 B：处理连续大写（如 XMLParser → xml_parser，Http2Client → http2_client）。
      */
     public static function camelToUnderscore(string $input): string
     {
-        $input = lcfirst($input);
-        $output = preg_replace_callback(
-            '/(?<=\w)(?=[A-Z])|(?<=[a-z])(?=[A-Z])|(?<=\d)(?=[A-Za-z])/',
-            fn() => '_',
-            $input
-        );
-        return strtolower($output);
+        // 先在"连续大写 + 大写开头小写"边界插入下划线（XMLParser → XML_Parser）
+        $result = preg_replace('/([A-Z]+)([A-Z][a-z])/', '$1_$2', $input);
+        // 再在"小写/数字 + 大写"边界插入下划线（Http2Client → Http2_Client）
+        $result = preg_replace('/([a-z\d])([A-Z])/', '$1_$2', $result);
+        return strtolower($result);
     }
 
     /**
@@ -109,14 +109,22 @@ class Str
     }
 
     /**
-     * 字节格式化（将字节数转为人类可读格式）
+     * 字节格式化（将字节数转为人类可读格式）。
+     *
+     * P2-45 方案 A：明确 SI（1000 基，KB/MB）与 IEC（1024 基，KiB/MiB）两种标准，
+     * 默认 IEC（1024 基）符合多数运维场景；调用方可传 $iec=false 切换 SI。
      */
-    public static function formatBytes(int $bytes, int $precision = 2): string
+    public static function formatBytes(int $bytes, bool $iec = true, int $precision = 2): string
     {
-        $units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-        for ($i = 0; $bytes > 1024 && $i < count($units) - 1; $i++) {
-            $bytes /= 1024;
+        if ($bytes <= 0) {
+            return '0 B';
         }
-        return round($bytes, $precision) . ' ' . $units[$i];
+        $base = $iec ? 1024 : 1000;
+        $units = $iec
+            ? ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
+            : ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+        $exp = (int)floor(log($bytes, $base));
+        $exp = min($exp, count($units) - 1);
+        return round($bytes / pow($base, $exp), $precision) . ' ' . $units[$exp];
     }
 }

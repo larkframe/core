@@ -32,9 +32,18 @@ class File
         if (is_link($dir) || is_file($dir)) {
             return unlink($dir);
         }
+        if (!is_dir($dir)) {
+            return false;
+        }
         $files = array_diff(scandir($dir), ['.', '..']);
         foreach ($files as $file) {
-            (is_dir("$dir/$file") && !is_link($dir)) ? static::removeDir("$dir/$file") : unlink("$dir/$file");
+            $path = $dir . DIRECTORY_SEPARATOR . $file;
+            // 必须检查当前条目 $path 而非父目录 $dir，否则会递归进入符号链接目标越权删库
+            if (is_dir($path) && !is_link($path)) {
+                static::removeDir($path);
+            } else {
+                unlink($path);
+            }
         }
         return rmdir($dir);
     }
@@ -63,14 +72,18 @@ class File
     }
 
     /**
-     * 确保目录存在，不存在则递归创建
+     * 确保目录存在，不存在则递归创建。
+     *
+     * P2-42 方案 A：并发场景下两个进程同时检测 !is_dir 后都调 mkdir，第二个会因目录已存在而失败。
+     * 用 @ 抑制 "File exists" 警告，再二次 is_dir 验证真实结果，兼容并发创建。
      */
     public static function ensureDir(string $dir, int $mode = 0755): bool
     {
         if (is_dir($dir)) {
             return true;
         }
-        return mkdir($dir, $mode, true);
+        @mkdir($dir, $mode, true);
+        return is_dir($dir);
     }
 
     /**

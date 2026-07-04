@@ -18,6 +18,7 @@ class NotFoundException extends \Exception implements NotFoundExceptionInterface
 
 use Throwable;
 use function array_key_exists;
+use function array_slice;
 use function class_exists;
 use function interface_exists;
 use function is_array;
@@ -47,16 +48,18 @@ class Container implements ContainerInterface
     protected array $aliases = [];
 
     /**
-     * Parameter overrides for specific classes.
-     */
-    protected array $parameterOverrides = [];
-
-    /**
      * ReflectionClass cache to avoid repeated reflection overhead.
+     * 实例属性（P2-6 方案 A）：避免 static 跨实例共享导致测试间状态污染。
      *
      * @var ReflectionClass[]
      */
-    protected static array $reflectionCache = [];
+    protected array $reflectionCache = [];
+
+    /**
+     * Fallback global instance when Config has no container configured.
+     * Prevents null dereference in __callStatic and infinite recursion.
+     */
+    private static ?self $globalInstance = null;
 
     /**
      * Get a service instance (singleton by default).
@@ -79,15 +82,15 @@ class Container implements ContainerInterface
     }
 
     /**
-     * Check if a service exists.
+     * Check if a service exists (PSR-11: "can the container return this entry").
+     * Only returns true for explicitly bound or already-resolved entries;
+     * auto-wirable classes are not considered "existing entries".
      */
     public function has(string $name): bool
     {
         $canonical = $this->resolveAlias($name);
         return array_key_exists($canonical, $this->instances)
-            || array_key_exists($canonical, $this->definitions)
-            || class_exists($canonical)
-            || interface_exists($canonical);
+            || array_key_exists($canonical, $this->definitions);
     }
 
     /**
@@ -107,8 +110,11 @@ class Container implements ContainerInterface
 
         $this->definitions[$abstract] = $concrete;
 
+        // P2-8 方案 A：重新绑定时显式管理 singletons 标记，避免原 singleton 重新 bind 为非 singleton 后仍按单例缓存
         if ($singleton) {
             $this->singletons[$abstract] = true;
+        } else {
+            unset($this->singletons[$abstract]);
         }
 
         return $this;
@@ -135,26 +141,12 @@ class Container implements ContainerInterface
 
     /**
      * Create a new instance without caching (always fresh).
+     * Parameter overrides are passed through the call chain to avoid shared mutable state.
      */
     public function make(string $name, array $parameters = []): mixed
     {
         $canonical = $this->resolveAlias($name);
-        $previousOverrides = $this->parameterOverrides[$canonical] ?? [];
-        if ($parameters !== []) {
-            $this->parameterOverrides[$canonical] = $parameters;
-        }
-
-        try {
-            return $this->resolve($canonical);
-        } finally {
-            if ($parameters !== []) {
-                if ($previousOverrides !== []) {
-                    $this->parameterOverrides[$canonical] = $previousOverrides;
-                } else {
-                    unset($this->parameterOverrides[$canonical]);
-                }
-            }
-        }
+        return $this->resolve($canonical, $parameters);
     }
 
     /**
@@ -180,10 +172,11 @@ class Container implements ContainerInterface
     /**
      * Resolve a service from the container.
      *
+     * @param array $overrides Constructor parameter overrides (透传避免共享状态污染)
      * @throws ContainerExceptionInterface
      * @throws NotFoundExceptionInterface
      */
-    protected function resolve(string $name): mixed
+    protected function resolve(string $name, array $overrides = []): mixed
     {
         if (isset($this->definitions[$name])) {
             $definition = $this->definitions[$name];
@@ -193,7 +186,7 @@ class Container implements ContainerInterface
             }
 
             if (is_string($definition) && $definition !== $name) {
-                return $this->get($definition);
+                return $this->resolve($definition, $overrides);
             }
 
             if (is_array($definition)) {
@@ -205,24 +198,25 @@ class Container implements ContainerInterface
             throw new NotFoundException("Unable to resolve '$name': class not found and no binding exists");
         }
 
-        return $this->autowire($name);
+        return $this->autowire($name, $overrides);
     }
 
     /**
      * Auto-wire a class by resolving its constructor dependencies.
      *
+     * @param array $overrides Constructor parameter overrides (透传)
      * @throws ContainerExceptionInterface
      */
-    protected function autowire(string $class): object
+    protected function autowire(string $class, array $overrides = []): object
     {
-        $reflector = static::$reflectionCache[$class] ?? null;
+        $reflector = $this->reflectionCache[$class] ?? null;
         if ($reflector === null) {
             try {
                 $reflector = new ReflectionClass($class);
             } catch (\ReflectionException $e) {
                 throw new ContainerException("Unable to reflect class '$class': " . $e->getMessage(), 0, $e);
             }
-            static::$reflectionCache[$class] = $reflector;
+            $this->reflectionCache[$class] = $reflector;
         }
 
         if (!$reflector->isInstantiable()) {
@@ -235,7 +229,7 @@ class Container implements ContainerInterface
             return new $class();
         }
 
-        $parameters = $this->resolveParameters($constructor->getParameters(), $class);
+        $parameters = $this->resolveParameters($constructor->getParameters(), $class, $overrides);
 
         try {
             return $reflector->newInstanceArgs($parameters);
@@ -246,10 +240,11 @@ class Container implements ContainerInterface
 
     /**
      * Resolve constructor parameters.
+     *
+     * @param array $overrides Constructor parameter overrides (透传，替代实例属性避免并发污染)
      */
-    protected function resolveParameters(array $reflectionParameters, string $class): array
+    protected function resolveParameters(array $reflectionParameters, string $class, array $overrides = []): array
     {
-        $overrides = $this->parameterOverrides[$class] ?? [];
         $resolved = [];
 
         foreach ($reflectionParameters as $param) {
@@ -272,8 +267,12 @@ class Container implements ContainerInterface
                     try {
                         $resolved[] = $this->get($typeName);
                         continue;
-                    } catch (Throwable) {
-                        // Fall through to default
+                    } catch (Throwable $e) {
+                        // 可选依赖失败用默认值；必需依赖失败必须抛出，避免真实异常被静默吞掉
+                        if ($param->isDefaultValueAvailable() || $param->isOptional()) {
+                            continue;
+                        }
+                        throw $e;
                     }
                 }
             }
@@ -321,7 +320,11 @@ class Container implements ContainerInterface
     protected function resolveAlias(string $name): string
     {
         $seen = [];
+        $maxDepth = 64; // P2-7 方案 A：限制别名链深度，防御恶意超长链 DoS
         while (isset($this->aliases[$name])) {
+            if (count($seen) >= $maxDepth) {
+                throw new ContainerException("Alias chain too deep (>{$maxDepth}) for '$name'");
+            }
             if (isset($seen[$name])) {
                 throw new ContainerException("Circular alias detected for '$name'");
             }
@@ -349,11 +352,15 @@ class Container implements ContainerInterface
 
     /**
      * Get the global container instance from config.
-     * This replaces the old LarkFrame\Container static proxy.
+     * Falls back to a default singleton to prevent null dereference and infinite recursion.
      */
     public static function getInstance(): static
     {
-        return \LarkFrame\Config::get('container');
+        $fromConfig = \LarkFrame\Config::get('container');
+        if ($fromConfig instanceof static) {
+            return $fromConfig;
+        }
+        return self::$globalInstance ??= new self();
     }
 
     /**

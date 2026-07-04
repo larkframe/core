@@ -79,6 +79,14 @@ kill $(cat runtime/server.pid)
 2. `onMessage` — 接收请求，匹配路由，执行回调，发送响应
 3. 路由回调使用 LRU 缓存（默认 1024 条），避免重复解析
 
+### Worker 生命周期
+
+- **连接管理**：每个 Worker 维护 `$connections` 数组跟踪活跃连接，连接关闭时自动从数组中移除（通过 `onClose` 回调包装），防止内存泄漏
+- **崩溃退避**：若 Worker 进程启动后 5 秒内退出，master 会延迟 2 秒再 refork，避免配置错误导致的 crash loop
+- **优雅关闭**：收到 SIGINT/SIGTERM 后，Worker 停止接受新连接，等待已有连接关闭（超时 `stopTimeout` 秒后强制退出）
+- **reload 过滤**：`reloadWorkers()` 仅对 `reloadable = true` 的 Worker 发送 SIGINT，非 reloadable Worker 不受影响
+- **Master 回调**：`$onMasterReload` 在 reload 信号触发时调用，`$onMasterStop` 在 master 进程停止时调用
+
 ## Shell 模式
 
 命令行执行单次任务，路由前缀 `/` 可省略：
@@ -204,7 +212,9 @@ Web 模式下：
 
 ## 错误处理
 
-- 生产环境：返回简洁错误页面
-- 调试模式（`app.debug = true`）：返回完整异常信息
+- 生产环境（默认）：仅返回异常消息，不暴露堆栈信息
+- 调试模式（`app.debug = true`）：返回完整异常信息（含堆栈、文件路径）
 - 支持自定义错误页面模板：`config('error_page.template')`
 - 支持 404/500 等状态码跳转：`config('error_page.404')`
+
+> **安全提示**：`app.debug` 默认为 `false`。生产环境切勿开启 debug 模式，否则会向客户端泄露服务器内部路径和堆栈信息。

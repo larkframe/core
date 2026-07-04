@@ -34,4 +34,10 @@ interface ChannelInterface
      * Close the channel.
      */
     public function close(): void;
+
+    /**
+     * P2-28：检查通道是否已关闭。
+     * 调用方配合 push/pop 的 false 返回值区分"超时"与"通道关闭"。
+     */
+    public function isClosed(): bool;
 }

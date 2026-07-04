@@ -3,6 +3,7 @@
 namespace LarkFrame;
 
 use Exception;
+use LarkFrame\Config;
 use LarkFrame\Consts;
 use LarkFrame\Request\RequestSourceInterface;
 use LarkFrame\Request\ServerSource;
@@ -14,6 +15,7 @@ use Stringable;
 use LarkFrame\Connection\TcpConnection;
 use LarkFrame\Protocols\Http;
 use LarkFrame\UploadFile;
+use function array_map;
 use function array_walk_recursive;
 use function bin2hex;
 use function clearstatcache;
@@ -22,6 +24,7 @@ use function current;
 use function explode;
 use function file_put_contents;
 use function filter_var;
+use function in_array;
 use function ip2long;
 use function is_array;
 use function is_file;
@@ -878,13 +881,34 @@ class Request implements Stringable
 
     /**
      * Get real IP (considering proxies).
+     *
+     * P2-11 方案 A：仅在 remoteIp 属于可信代理白名单（config('app.trusted_proxies')）时
+     * 才信任 X-Forwarded-For / X-Real-IP 等转发头，避免恶意客户端伪造 IP。
      */
     public function getRealIp(bool $safeMode = true): string
     {
-        $remoteIp = $this->getRemoteIp();
+        // 获取原始对端 IP 用于可信代理校验。
+        // web 模式下 getRemoteIp() 调用 getClientIp() 已做 XFF 解析，
+        // 此处需用原始 REMOTE_ADDR 判断是否可信代理，否则校验对象错误。
+        if (defined('RUN_TYPE') && RUN_TYPE != Consts::RUN_TYPE_SERVER) {
+            $remoteIp = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
+        } else {
+            $remoteIp = $this->connection ? $this->connection->getRemoteIp() : '127.0.0.1';
+        }
+
         if ($safeMode && !static::isIntranetIp($remoteIp)) {
             return $remoteIp;
         }
+
+        // 可信代理白名单校验：'*' 表示信任所有（仅开发环境）
+        $trustedProxies = Config::get('app.trusted_proxies', []);
+        $isTrustedProxy = $trustedProxies === '*'
+            || in_array($remoteIp, (array)$trustedProxies, true);
+
+        if (!$isTrustedProxy) {
+            return $remoteIp;
+        }
+
         $ip = $this->header('x-forwarded-for')
             ?? $this->header('x-real-ip')
             ?? $this->header('client-ip')
@@ -892,7 +916,14 @@ class Request implements Stringable
             ?? $this->header('via')
             ?? $remoteIp;
         if (is_string($ip)) {
-            $ip = current(explode(',', $ip));
+            // 取最左非可信 IP，避免代理链中包含代理自身 IP
+            $ips = array_map('trim', explode(',', $ip));
+            foreach ($ips as $candidate) {
+                if (filter_var($candidate, FILTER_VALIDATE_IP) && !in_array($candidate, (array)$trustedProxies, true)) {
+                    return $candidate;
+                }
+            }
+            $ip = $ips[0] ?? $remoteIp;
         }
         return filter_var($ip, FILTER_VALIDATE_IP) ? $ip : $remoteIp;
     }

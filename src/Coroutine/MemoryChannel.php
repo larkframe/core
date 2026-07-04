@@ -53,7 +53,28 @@ class MemoryChannel implements ChannelInterface
 
         $deadline = $timeout >= 0 ? microtime(true) + $timeout : PHP_FLOAT_MAX;
 
-        while ($this->capacity > 0 && $this->queue->count() >= $this->capacity) {
+        if ($this->capacity === 0) {
+            // Rendezvous mode: push completes only when a pop consumes the data
+            $this->queue->enqueue($data);
+            $this->wakePopWaiter();
+            while (!$this->queue->isEmpty()) {
+                if ($this->closed) {
+                    return false;
+                }
+                if (microtime(true) >= $deadline) {
+                    return false;
+                }
+                if (Fiber::getCurrent() !== null) {
+                    $this->pushWaiters[] = Fiber::getCurrent();
+                    Fiber::suspend();
+                } else {
+                    usleep(self::POLL_INTERVAL_US);
+                }
+            }
+            return true;
+        }
+
+        while ($this->queue->count() >= $this->capacity) {
             if (microtime(true) >= $deadline) {
                 return false;
             }
@@ -71,8 +92,16 @@ class MemoryChannel implements ChannelInterface
         }
 
         $this->queue->enqueue($data);
+        $this->wakePopWaiter();
 
-        // Wake up a pop waiter if any
+        return true;
+    }
+
+    /**
+     * Wake up a pop waiter if any.
+     */
+    private function wakePopWaiter(): void
+    {
         while ($this->popWaiters !== []) {
             $waiter = array_shift($this->popWaiters);
             if ($waiter->isSuspended()) {
@@ -80,8 +109,6 @@ class MemoryChannel implements ChannelInterface
                 break;
             }
         }
-
-        return true;
     }
 
     public function pop(float $timeout = -1): mixed
@@ -152,5 +179,17 @@ class MemoryChannel implements ChannelInterface
         }
         $this->popWaiters = [];
         $this->pushWaiters = [];
+    }
+
+    /**
+     * P2-26/28：检查通道是否已关闭。
+     *
+     * push/pop 返回 false 时，调用方可用 isClosed() 区分：
+     *   - isClosed() === true  → 通道已关闭
+     *   - isClosed() === false → 超时（仍有数据/空间但未在 timeout 内完成）
+     */
+    public function isClosed(): bool
+    {
+        return $this->closed;
     }
 }

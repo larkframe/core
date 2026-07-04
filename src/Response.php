@@ -102,6 +102,19 @@ class Response implements Stringable
         'flv' => 'video/x-flv', 'm4v' => 'video/x-m4v', 'mng' => 'video/x-mng',
         'asx' => 'video/x-ms-asf', 'asf' => 'video/x-ms-asf', 'wmv' => 'video/x-ms-wmv',
         'avi' => 'video/x-msvideo', 'ttf' => 'font/ttf',
+        // P2-9 方案 A：补全现代 Web 格式
+        'woff2' => 'font/woff2',
+        'avif' => 'image/avif',
+        'avifs' => 'image/avif-sequence',
+        'csv' => 'text/csv',
+        'md' => 'text/markdown',
+        'yaml' => 'application/yaml',
+        'yml' => 'application/yaml',
+        'webmanifest' => 'application/manifest+json',
+        'opus' => 'audio/opus',
+        'mp4a' => 'audio/mp4',
+        'heic' => 'image/heic',
+        'heif' => 'image/heif',
     ];
 
     /**
@@ -310,14 +323,69 @@ class Response implements Stringable
 
     /**
      * Set file response.
+     *
+     * 支持显式 offset/length 和自动解析 Range 请求头。
+     * 当指定 offset/length 或客户端发送 Range 头时，返回 206 Partial Content。
      */
     public function withFile(string $file, int $offset = 0, int $length = 0): static
     {
         if (!is_file($file)) {
             return $this->withStatus(404)->withBody('<h3>404 Not Found</h3>');
         }
+
+        $fileSize = filesize($file);
+
+        // 自动解析 Range 请求头（仅当未显式指定 offset/length 时）
+        if ($offset === 0 && $length === 0) {
+            $range = $_SERVER['HTTP_RANGE'] ?? null;
+            if ($range !== null && is_string($range)) {
+                [$offset, $length] = $this->parseRangeHeader($range, $fileSize);
+            }
+        }
+
+        // 设置 Range 相关头
+        if ($offset > 0 || $length > 0) {
+            $length = $length > 0 ? $length : $fileSize - $offset;
+            $end = $offset + $length - 1;
+            $this->withStatus(206)
+                 ->withHeader('Accept-Ranges', 'bytes')
+                 ->withHeader('Content-Range', "bytes {$offset}-{$end}/{$fileSize}");
+        } else {
+            $this->withHeader('Accept-Ranges', 'bytes');
+            $length = $fileSize;
+        }
+
         $this->file = ['file' => $file, 'offset' => $offset, 'length' => $length];
         return $this;
+    }
+
+    /**
+     * 解析 HTTP Range 请求头
+     * 支持: bytes=0-1023, bytes=0-, bytes=-500 (suffix)
+     *
+     * @return array{0:int,1:int} [offset, length]
+     */
+    protected function parseRangeHeader(string $range, int $fileSize): array
+    {
+        if (!preg_match('/^bytes=(\d*)-(\d*)$/', $range, $m)) {
+            return [0, 0];
+        }
+
+        $start = $m[1] !== '' ? (int)$m[1] : null;
+        $end = $m[2] !== '' ? (int)$m[2] : null;
+
+        // suffix range: bytes=-500 (last 500 bytes)
+        if ($start === null && $end !== null) {
+            $start = max(0, $fileSize - $end);
+            $end = $fileSize - 1;
+        } elseif ($start !== null && $end === null) {
+            $end = $fileSize - 1;
+        } elseif ($start === null || $end === null || $start > $end || $start >= $fileSize) {
+            return [0, 0];
+        }
+
+        $end = min($end, $fileSize - 1);
+        return [$start, $end - $start + 1];
     }
 
     /**
@@ -406,9 +474,12 @@ class Response implements Stringable
         $headers['Connection'] ??= 'keep-alive';
 
         $file = $fileInfo['file'];
-        $fileInfo = pathinfo($file);
-        $extension = $fileInfo['extension'] ?? '';
-        $baseName = $fileInfo['basename'] ?: 'unknown';
+        $offset = $fileInfo['offset'] ?? 0;
+        $length = $fileInfo['length'] ?? 0;
+
+        $pathInfo = pathinfo($file);
+        $extension = $pathInfo['extension'] ?? '';
+        $baseName = $pathInfo['basename'] ?: 'unknown';
 
         if (!isset($headers['Content-Type'])) {
             $headers['Content-Type'] = self::$mimeTypeMap[$extension] ?? 'application/octet-stream';
@@ -422,7 +493,24 @@ class Response implements Stringable
             $headers['Last-Modified'] = gmdate('D, d M Y H:i:s', $mtime) . ' GMT';
         }
 
-        return static::getSender()->formatFileResponse($this->status, $this->version, $this->reason, $headers);
+        // 根据 offset/length 设置 Content-Length
+        if ($length > 0) {
+            $headers['Content-Length'] = (string)$length;
+        } elseif ($offset > 0) {
+            $headers['Content-Length'] = (string)(filesize($file) - $offset);
+        } else {
+            $headers['Content-Length'] = (string)filesize($file);
+        }
+
+        // FPM 模式下传入 file 信息使 WebSender 输出正文；Server 模式 ServerSender 忽略该参数
+        $isFpmMode = defined('RUN_TYPE') && RUN_TYPE === Consts::RUN_TYPE_WEB;
+        return static::getSender()->formatFileResponse(
+            $this->status,
+            $this->version,
+            $this->reason,
+            $headers,
+            $isFpmMode ? $fileInfo : null
+        );
     }
 
     /**

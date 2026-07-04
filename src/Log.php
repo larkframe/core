@@ -39,7 +39,14 @@ class Log
     public static function channel(string $name = 'default'): Logger
     {
         if (!isset(static::$instance[$name])) {
-            $config = config('log', [])[$name];
+            $logConfig = config('log', []);
+            if (!is_array($logConfig)) {
+                throw new \InvalidArgumentException('log config must be an array');
+            }
+            $config = $logConfig[$name] ?? null;
+            if ($config === null) {
+                throw new \InvalidArgumentException("Log channel '{$name}' not configured");
+            }
 
             $handlers = self::handlers($config);
             $processors = self::processors($config);
@@ -59,10 +66,14 @@ class Log
      */
     protected static function handlers(array $config): array
     {
-        $handlerConfigs = $config['handlers'] ?? [[]];
+        // 默认 StreamHandler，level 根据 app.debug 动态决定：开发 DEBUG / 生产 INFO
+        $defaultLevel = config('app.debug', false) ? Logger::DEBUG : Logger::INFO;
+        $handlerConfigs = $config['handlers'] ?? [
+            ['class' => \Monolog\Handler\StreamHandler::class, 'constructor' => [runtime_path('logs/app.log'), $defaultLevel]]
+        ];
         $handlers = [];
         foreach ($handlerConfigs as $value) {
-            $class = $value['class'] ?? [];
+            $class = $value['class'] ?? '';
             $constructor = $value['constructor'] ?? [];
 
             $formatterConfig = $value['formatter'] ?? [];
@@ -86,13 +97,13 @@ class Log
         $handler = new $class(... array_values($constructor));
 
         if ($handler instanceof FormattableHandlerInterface && $formatterConfig) {
-            $formatterClass = $formatterConfig['class'];
-            $formatterConstructor = $formatterConfig['constructor'];
-
-            /** @var FormatterInterface $formatter */
-            $formatter = new $formatterClass(... array_values($formatterConstructor));
-
-            $handler->setFormatter($formatter);
+            $formatterClass = $formatterConfig['class'] ?? null;
+            $formatterConstructor = $formatterConfig['constructor'] ?? [];
+            if ($formatterClass !== null) {
+                /** @var FormatterInterface $formatter */
+                $formatter = new $formatterClass(... array_values($formatterConstructor));
+                $handler->setFormatter($formatter);
+            }
         }
 
         return $handler;

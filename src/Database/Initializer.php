@@ -22,34 +22,39 @@ class Initializer
         if (self::$initialized) {
             return;
         }
-        self::$initialized = true;
 
         $connections = $config['connections'] ?? [];
         if (!$connections) {
             return;
         }
 
-        $capsule = new Capsule(IlluminateContainer::getInstance());
+        try {
+            $capsule = new Capsule(IlluminateContainer::getInstance());
 
-        $default = $config['default'] ?? false;
-        if ($default && isset($connections[$default])) {
-            $capsule->addConnection($connections[$default], $default);
-            $capsule->getDatabaseManager()->setDefaultConnection($default);
-            unset($connections[$default]);
+            $default = $config['default'] ?? false;
+            if ($default && isset($connections[$default])) {
+                $capsule->addConnection($connections[$default], $default);
+                $capsule->getDatabaseManager()->setDefaultConnection($default);
+                unset($connections[$default]);
+            }
+
+            foreach ($connections as $name => $connectionConfig) {
+                $capsule->addConnection($connectionConfig, $name);
+            }
+
+            if (class_exists(Dispatcher::class) && !$capsule->getEventDispatcher()) {
+                $capsule->setEventDispatcher(new Dispatcher(IlluminateContainer::getInstance()));
+            }
+
+            $capsule->setAsGlobal();
+            $capsule->bootEloquent();
+
+            static::setupPaginator();
+            self::$initialized = true;
+        } catch (\Throwable $e) {
+            self::$initialized = false;
+            throw $e;
         }
-
-        foreach ($connections as $name => $connectionConfig) {
-            $capsule->addConnection($connectionConfig, $name);
-        }
-
-        if (class_exists(Dispatcher::class) && !$capsule->getEventDispatcher()) {
-            $capsule->setEventDispatcher(new Dispatcher(IlluminateContainer::getInstance()));
-        }
-
-        $capsule->setAsGlobal();
-        $capsule->bootEloquent();
-
-        static::setupPaginator();
     }
 
     /**
@@ -77,7 +82,7 @@ class Initializer
 
         if (class_exists(CursorPaginator::class)) {
             CursorPaginator::currentCursorResolver(
-                fn(string $cursorName = 'cursor') => Cursor::fromEncoded(request()->input($cursorName))
+                fn(string $cursorName = 'cursor') => Cursor::fromEncoded(request()?->input($cursorName))
             );
         }
     }

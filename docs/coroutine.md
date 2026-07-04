@@ -64,6 +64,12 @@ $pool->put($conn);
 - **心跳检测**：定期检查连接可用性
 - **最小连接数**：保持 `min_connections` 个连接存活
 
+### WeakMap 遍历安全
+
+`Pool::closeConnections()` 和 `Context::gc()` 在遍历 WeakMap 时会修改其结构（移除条目）。PHP 中直接在 `foreach` 内 `unset` WeakMap 条目会导致迭代器跳过元素。这两个方法均先将 keys 复制到普通数组，再遍历数组执行移除操作，确保所有条目都被处理。
+
+`Context::gc()` 在清理完成后调用 `gc_collect_cycles()`，强制回收孤立的 `onDestroy` 对象并触发 `DestructionWatcher` 回调。
+
 ## 内存通道 (MemoryChannel)
 
 `LarkFrame\Coroutine\MemoryChannel` 基于 SplQueue 实现的协程安全通道：

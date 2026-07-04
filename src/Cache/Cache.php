@@ -66,7 +66,10 @@ class Cache
             throw new InvalidArgumentException("cache.store.$name is not defined. Please check config/cache.php");
         }
 
-        $driver = $stores[$name]['driver'];
+        $driver = $stores[$name]['driver'] ?? null;
+        if ($driver === null) {
+            throw new InvalidArgumentException("cache.store.{$name}.driver is not configured.");
+        }
 
         // Redis uses WeakMap tracking, not static instances
         if ($driver === 'redis') {
@@ -89,6 +92,9 @@ class Cache
      */
     private static function createRedisCache(array $config): Psr16Cache
     {
+        if (!isset($config['connection'])) {
+            throw new InvalidArgumentException('Redis cache store requires a "connection" key.');
+        }
         $redis = Redis::connection($config['connection']);
         if (isset(static::$weakMap[$redis])) {
             return static::$weakMap[$redis];
@@ -105,6 +111,9 @@ class Cache
      */
     private static function createFileCache(array $config): Psr16Cache
     {
+        if (!isset($config['path'])) {
+            throw new InvalidArgumentException('File cache store requires a "path" key.');
+        }
         return new Psr16Cache(new FilesystemAdapter('', 0, $config['path']));
     }
 

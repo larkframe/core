@@ -19,6 +19,10 @@ use function uniqid;
  *
  * Request source for the built-in server mode.
  * Data is parsed from the raw HTTP buffer on demand.
+ *
+ * P2-37：Server 模式下请求 body 由 Http::input/decode 从连接缓冲区读取，整体驻留内存。
+ * 大文件上传时受 TcpConnection::maxPackageSize 限制（超出返回 413）。
+ * 流式/临时文件暂存属于架构级新功能，当前不实现，依赖 maxPackageSize 兜底。
  */
 class ServerSource implements RequestSourceInterface
 {

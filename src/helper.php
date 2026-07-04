@@ -85,6 +85,9 @@ if (!function_exists('view')) {
     function view(mixed $template = null, array $vars = [], ?string $viewSuffix = null): Response
     {
         $handler = \config('view.handler');
+        if (!is_string($handler) || !class_exists($handler)) {
+            throw new \RuntimeException('view.handler config is not set to a valid class name');
+        }
         return new Response(200, [], $handler::render($template, $vars, $viewSuffix));
     }
 }
@@ -132,13 +135,9 @@ if (!function_exists('cpu_count')) {
         $count = 4;
         if (is_callable('shell_exec')) {
             if (strtolower(PHP_OS) === 'darwin') {
-                $count = (int)shell_exec('sysctl -n machdep.cpu.core_count');
+                $count = (int)shell_exec('sysctl -n hw.logicalcpu');
             } else {
-                try {
-                    $count = (int)shell_exec('nproc');
-                } catch (\Throwable $ex) {
-                    // Do nothing
-                }
+                $count = (int)shell_exec('nproc');
             }
         }
         return $count > 0 ? $count : 4;
@@ -154,7 +153,11 @@ if (!function_exists('input')) {
      */
     function input(?string $param = null, mixed $default = null): mixed
     {
-        return is_null($param) ? request()->all() : request()->input($param, $default);
+        $request = request();
+        if ($request === null) {
+            return $default;
+        }
+        return is_null($param) ? $request->all() : $request->input($param, $default);
     }
 }
 
@@ -162,7 +165,10 @@ if (!function_exists('input')) {
  * Get the base path of the application
  */
 if (!defined('ROOT_PATH')) {
-    if (!$rootPath = Phar::running()) {
+    $rootPath = '';
+    if (class_exists(\Phar::class, false) && ($pharPath = \Phar::running())) {
+        $rootPath = $pharPath;
+    } else {
         $rootPath = getcwd();
         while ($rootPath !== dirname($rootPath)) {
             if (@is_dir("$rootPath/vendor") && (@is_file("$rootPath/server.php") || @is_file("$rootPath/shell.php") || @is_file("$rootPath/task.php"))) {
@@ -171,7 +177,7 @@ if (!defined('ROOT_PATH')) {
             $rootPath = dirname($rootPath);
         }
         if ($rootPath === dirname($rootPath)) {
-            exit('Please define the ROOT_PATH constant in your public/index.php file.');
+            throw new \RuntimeException('Please define the ROOT_PATH constant in your public/index.php file.');
         }
     }
     define('ROOT_PATH', realpath($rootPath) ?: $rootPath);
@@ -196,17 +202,17 @@ if (!function_exists('run_path')) {
 
 if (!function_exists('config_path')) {
     /**
-     * Runtime path
+     * Config path
      * @param string $path
      * @return string
      */
-    function config_path(): string
+    function config_path(string $path = ''): string
     {
         static $configPath = '';
         if (!$configPath) {
             $configPath = run_path('config');
         }
-        return $configPath;
+        return path_combine($configPath, $path);
     }
 }
 
@@ -258,9 +264,9 @@ if (!function_exists('json')) {
      * Json response
      * @param $data
      * @param int $options
-     * @return Response|string|bool
+     * @return Response|string
      */
-    function json($data, int $options = JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR): Response|string|bool
+    function json($data, int $options = JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR): Response|string
     {
         return new Response(200, ['Content-Type' => 'application/json'], json_encode($data, $options));
     }
@@ -275,10 +281,21 @@ if (!function_exists('jsonp')) {
      */
     function jsonp($data, string $callbackName = 'callback'): Response
     {
-        if (!is_scalar($data) && null !== $data) {
-            $data = json_encode($data);
+        // 统一用 json_encode 处理所有数据类型，避免标量字符串注入
+        $encoded = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($encoded === false) {
+            $encoded = 'null';
         }
-        return new Response(200, [], "$callbackName($data)");
+        // 回调名白名单：仅允许字母数字下划线点号（RFC 8259 JSONP 实践）
+        $safeCallback = preg_replace('/[^A-Za-z0-9_\.]/', '', $callbackName);
+        if ($safeCallback === '') {
+            $safeCallback = 'callback';
+        }
+        return new Response(
+            200,
+            ['Content-Type' => 'application/javascript; charset=utf-8'],
+            "$safeCallback($encoded)"
+        );
     }
 }
 
@@ -299,40 +316,53 @@ if (!function_exists('getallheaders')) {
     }
 }
 
-function getRealHost($withoutPort = false)
-{
-    // 检查常见的代理头
-    $possibleHeaders = [
-        'HTTP_X_FORWARDED_HOST',
-        'HTTP_X_FORWARDED_SERVER',
-        'HTTP_HOST',
-        'SERVER_NAME',
-        'SERVER_ADDR'
-    ];
+if (!function_exists('getRealHost')) {
+    /**
+     * Get real host
+     * @param bool $withoutPort
+     * @return string
+     */
+    function getRealHost(bool $withoutPort = false): string
+    {
+        // 检查常见的代理头
+        $possibleHeaders = [
+            'HTTP_X_FORWARDED_HOST',
+            'HTTP_X_FORWARDED_SERVER',
+            'HTTP_HOST',
+            'SERVER_NAME',
+            'SERVER_ADDR'
+        ];
 
-    foreach ($possibleHeaders as $header) {
-        if (!empty($_SERVER[$header])) {
-            $host = $_SERVER[$header];
+        foreach ($possibleHeaders as $header) {
+            if (!empty($_SERVER[$header])) {
+                $host = $_SERVER[$header];
 
-            // 处理逗号分隔的多个值（如 X-Forwarded-Host: example.com,proxy.com）
-            if (str_contains($host, ',')) {
-                $hosts = explode(',', $host);
-                $host = trim(end($hosts)); // 取最后一个
+                // 处理逗号分隔的多个值（如 X-Forwarded-Host: client,proxy1,proxy2）
+                // 取第一个（最左侧）为原始客户端，与 X-Forwarded-For 语义一致
+                if (str_contains($host, ',')) {
+                    $hosts = explode(',', $host);
+                    $host = trim($hosts[0]);
+                }
+
+                // 移除端口号（可选）
+                if ($withoutPort) {
+                    $host = strstr($host, ':', true) ?: $host;
+                }
+                return $host;
             }
-
-            // 移除端口号（可选）
-            if ($withoutPort) {
-                $host = strtok($host, ':');
-            }
-            return $host;
         }
-    }
 
-    return 'unknown'; // 默认值
+        return 'unknown';
+    }
 }
 
-function getClientIp()
-{
+if (!function_exists('getClientIp')) {
+    /**
+     * Get client IP
+     * @return string
+     */
+    function getClientIp(): string
+    {
     $trustedProxies = Config::get('app.trusted_proxies', []);
     $remoteAddr = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
 
@@ -356,6 +386,7 @@ function getClientIp()
     }
 
     return $remoteAddr;
+    }
 }
 
 if (!function_exists('escape')) {

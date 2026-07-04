@@ -101,3 +101,15 @@ Route::group('/api', function () {
 | `getMiddleware()` | 获取中间件列表 |
 | `param($name)` | 获取路由参数 |
 | `url($params)` | 生成 URL |
+
+## 路由调度
+
+`Route::dispatch($method, $path)` 在内部调用 FastRoute dispatcher。调用前必须先执行 `Route::load()` 初始化 dispatcher，否则抛出 `RuntimeException`。
+
+```php
+Route::load();  // 初始化 dispatcher，加载 config/route.php
+$result = Route::dispatch('GET', '/users/1');
+// [FastRoute\Dispatcher::FOUND, $handler, $routeParams]
+```
+
+框架在 `App::run()` 中已自动调用 `Route::load()`，通常无需手动调用。

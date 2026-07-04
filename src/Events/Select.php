@@ -26,6 +26,11 @@ class Select implements EventInterface
     private const MAX_SELECT_TIMEOUT_US = 800000;
 
     /**
+     * Scheduler rebuild threshold: after this many cancellations, rebuild to free memory.
+     */
+    private const REBUILD_THRESHOLD = 100;
+
+    /**
      * Running flag.
      */
     private bool $running = true;
@@ -105,6 +110,11 @@ class Select implements EventInterface
     private float $nextTickTime = 0;
 
     /**
+     * Cancelled timer count for lazy deletion rebuild trigger.
+     */
+    private int $cancelledCount = 0;
+
+    /**
      * Error handler callback.
      */
     private ?\Closure $errorHandler = null;
@@ -128,7 +138,7 @@ class Select implements EventInterface
         $this->scheduler->insert($timerId, -$runTime);
         $this->eventTimer[$timerId] = [$func, $args];
 
-        if ($this->nextTickTime == 0 || $this->nextTickTime > $runTime) {
+        if ($this->nextTickTime <= 0 || $this->nextTickTime > $runTime) {
             $this->setNextTickTime($runTime);
         }
 
@@ -142,6 +152,10 @@ class Select implements EventInterface
     {
         if (isset($this->eventTimer[$timerId])) {
             unset($this->eventTimer[$timerId]);
+            $this->cancelledCount++;
+            if ($this->cancelledCount >= self::REBUILD_THRESHOLD) {
+                $this->rebuildScheduler();
+            }
             return true;
         }
         return false;
@@ -157,7 +171,7 @@ class Select implements EventInterface
         $this->scheduler->insert($timerId, -$runTime);
         $this->eventTimer[$timerId] = [$func, $args, $interval];
 
-        if ($this->nextTickTime == 0 || $this->nextTickTime > $runTime) {
+        if ($this->nextTickTime <= 0 || $this->nextTickTime > $runTime) {
             $this->setNextTickTime($runTime);
         }
 
@@ -259,7 +273,10 @@ class Select implements EventInterface
         }
 
         $this->signalEvents[$signal] = $func;
-        pcntl_signal($signal, fn() => $this->safeCall($this->signalEvents[$signal], [$signal]));
+        // 捕获 $func 值而非动态读取 $this->signalEvents[$signal]，避免 offSignal 后信号到达读到 null
+        pcntl_signal($signal, function () use ($signal, $func) {
+            $this->safeCall($func, [$signal]);
+        });
     }
 
     /**
@@ -271,7 +288,8 @@ class Select implements EventInterface
             return false;
         }
 
-        pcntl_signal($signal, SIG_IGN);
+        // 恢复 SIG_DFL 默认处理（与 offAll 一致），确保信号可被进程正常接收/终止
+        pcntl_signal($signal, SIG_DFL);
 
         if (isset($this->signalEvents[$signal])) {
             unset($this->signalEvents[$signal]);
@@ -337,7 +355,8 @@ class Select implements EventInterface
     {
         $this->nextTickTime = $nextTickTime;
 
-        if ($nextTickTime == 0) {
+        // P2-3 方案 B：用 <= 0 替代 == 0 浮点比较，防御负数/极小浮点异常
+        if ($nextTickTime <= 0) {
             $this->selectTimeout = self::MAX_SELECT_TIMEOUT_US;
             return;
         }
@@ -353,9 +372,31 @@ class Select implements EventInterface
      */
     public function deleteAllTimer(): void
     {
+        // 保持 timerId 单调递增（P2-1 方案 B），避免 deleteAllTimer 后旧 id 引用与新注册 id 冲突
         $this->scheduler = new SplPriorityQueue();
         $this->scheduler->setExtractFlags(SplPriorityQueue::EXTR_BOTH);
         $this->eventTimer = [];
+        $this->cancelledCount = 0;
+        $this->nextTickTime = 0;
+        $this->selectTimeout = self::MAX_SELECT_TIMEOUT_US;
+    }
+
+    /**
+     * Rebuild scheduler by removing entries for cancelled timers.
+     */
+    private function rebuildScheduler(): void
+    {
+        $validEntries = [];
+        while (!$this->scheduler->isEmpty()) {
+            $item = $this->scheduler->extract();
+            if (isset($this->eventTimer[$item['data']])) {
+                $validEntries[] = $item;
+            }
+        }
+        foreach ($validEntries as $item) {
+            $this->scheduler->insert($item['data'], $item['priority']);
+        }
+        $this->cancelledCount = 0;
     }
 
     /**
@@ -370,9 +411,11 @@ class Select implements EventInterface
 
             if ($read || $write || $except) {
                 try {
+                    // stream_select 返回 false 表示信号中断或错误，不应终止事件循环
                     @stream_select($read, $write, $except, 0, $this->selectTimeout);
                 } catch (Throwable) {
                     // stream_select can throw on signal interruption
+                    $read = $write = $except = [];
                 }
             } else {
                 $this->selectTimeout >= 1 && usleep($this->selectTimeout);
@@ -382,12 +425,9 @@ class Select implements EventInterface
             $this->dispatchEvents($write, $this->writeEvents);
             $this->dispatchEvents($except, $this->exceptEvents);
 
-            if ($this->nextTickTime > 0) {
-                if (microtime(true) >= $this->nextTickTime) {
-                    $this->tick();
-                } else {
-                    $this->selectTimeout = (int)(($this->nextTickTime - microtime(true)) * 1_000_000);
-                }
+            // 持续处理到期定时器，避免单轮延迟累积
+            while ($this->nextTickTime > 0 && microtime(true) >= $this->nextTickTime) {
+                $this->tick();
             }
 
             if (DIRECTORY_SEPARATOR === '/') {
@@ -415,13 +455,16 @@ class Select implements EventInterface
     /**
      * @inheritDoc
      */
-    public function stop(): void
+    public function offAll(): void
     {
-        $this->running = false;
         $this->deleteAllTimer();
 
-        foreach ($this->signalEvents as $signal => $item) {
-            $this->offSignal($signal);
+        // P2-2 方案 A：stop 恢复 SIG_DFL 默认处理（而非 SIG_IGN），确保 stop 后进程仍可被 SIGTERM 正常终止
+        foreach (array_keys($this->signalEvents) as $signal) {
+            if (function_exists('pcntl_signal')) {
+                pcntl_signal($signal, SIG_DFL);
+            }
+            unset($this->signalEvents[$signal]);
         }
 
         $this->readFds = [];
@@ -430,7 +473,15 @@ class Select implements EventInterface
         $this->readEvents = [];
         $this->writeEvents = [];
         $this->exceptEvents = [];
-        $this->signalEvents = [];
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function stop(): void
+    {
+        $this->running = false;
+        $this->offAll();
     }
 
     /**
@@ -457,7 +508,16 @@ class Select implements EventInterface
         try {
             $func(...$args);
         } catch (Throwable $e) {
-            $this->errorHandler?->__invoke($e) ?? print($e);
+            if ($this->errorHandler !== null) {
+                try {
+                    ($this->errorHandler)($e);
+                } catch (Throwable $inner) {
+                    // errorHandler 自身异常只能记录，不能再抛
+                    error_log("[EventLoop] errorHandler threw: " . $inner->getMessage() . " | original: " . $e->getMessage());
+                }
+            } else {
+                error_log("[EventLoop] uncaught: " . $e->getMessage() . "\n" . $e->getTraceAsString());
+            }
         }
     }
 }
