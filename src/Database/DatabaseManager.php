@@ -105,15 +105,4 @@ class DatabaseManager extends BaseDatabaseManager
     {
         $connection->disconnect();
     }
-
-    /**
-     * Start pool maintenance timers for all pools.
-     * 仅适用于事件循环就绪前已存在的池；懒创建的池在 createPool 内自注册。
-     */
-    public static function startPoolMaintenance(\LarkFrame\Events\EventInterface $eventLoop): void
-    {
-        foreach (static::$pools as $pool) {
-            $pool->startMaintenance($eventLoop);
-        }
-    }
 }

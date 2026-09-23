@@ -759,6 +759,10 @@ class Worker
             return;
         }
         // Worker process.
+        // fork 会复制 master 的日志缓冲，不清空则本进程退出时（shutdown flush）会把
+        // master 已记录/待记录的内容再写一遍，造成同一条日志在文件里重复出现
+        static::$logBuffer = [];
+        static::$logBufferSize = 0;
         $worker->run();
         exit(0);
     }
@@ -793,6 +797,10 @@ class Worker
         });
         pcntl_alarm(5);
 
+        // 崩溃退避中的待重启项（列表而非 workerId 映射：同一 worker 的多个进程可能同时崩溃，
+        // 用映射作键会互相覆盖导致漏重启）。每项为 ['workerId' => string, 'at' => int]
+        $pendingRestarts = [];
+
         while (true) {
             pcntl_signal_dispatch();
             $status = 0;
@@ -800,8 +808,9 @@ class Worker
             $pid = pcntl_wait($status);
             pcntl_signal_dispatch();
 
-            // Re-arm the alarm
-            pcntl_alarm(5);
+            // Re-arm the alarm：有待重启项时缩短间隔，使退避到期能及时重启，
+            // 同时保持 master 对信号的响应粒度
+            pcntl_alarm($pendingRestarts === [] ? 5 : 1);
 
             if ($pid > 0) {
                 // A child process exited.
@@ -813,14 +822,38 @@ class Worker
                         unset(static::$workerStartTime[$pid]);
                         if (static::$status !== static::STATUS_SHUTDOWN) {
                             if ($startTime !== null && (time() - $startTime) < 5) {
+                                // 记录待重启而非 sleep(2)：sleep 期间 master 不 dispatch 信号
+                                // （stop/reload 延迟响应）也不 wait 子进程（退出的变成僵尸）
                                 static::log("Worker (pid={$pid}) exited too quickly, delaying restart by 2s");
-                                sleep(2);
+                                $pendingRestarts[] = ['workerId' => $worker->workerId, 'at' => time() + 2];
+                            } else {
+                                // Restart the worker.
+                                static::forkOneWorker($worker);
                             }
-                            // Restart the worker.
-                            static::forkOneWorker($worker);
                         }
                         break;
                     }
+                }
+            }
+
+            if ($pendingRestarts !== []) {
+                if (static::$status === static::STATUS_SHUTDOWN) {
+                    // 关闭流程中放弃退避重启
+                    $pendingRestarts = [];
+                } else {
+                    $now = time();
+                    $remaining = [];
+                    foreach ($pendingRestarts as $item) {
+                        if ($now < $item['at']) {
+                            $remaining[] = $item;
+                            continue;
+                        }
+                        $worker = static::$workers[$item['workerId']] ?? null;
+                        if ($worker !== null) {
+                            static::forkOneWorker($worker);
+                        }
+                    }
+                    $pendingRestarts = $remaining;
                 }
             }
 
@@ -902,6 +935,13 @@ class Worker
 
         // Create socket.
         $flags = STREAM_SERVER_BIND | STREAM_SERVER_LISTEN;
+
+        // reusePort：多 worker 各自绑定同一端口必须开启 SO_REUSEPORT，
+        // 否则除首个进程外全部 "address in use" 退出，触发崩溃循环
+        if ($this->reusePort) {
+            stream_context_set_option($this->socketContext, 'socket', 'so_reuseport', 1);
+        }
+
         $this->mainSocket = stream_socket_server($socketName, $errno, $errmsg, $flags, $this->socketContext);
         if (!$this->mainSocket) {
             throw new RuntimeException("stream_socket_server() failed: $errmsg (errno=$errno)");
@@ -993,11 +1033,7 @@ class Worker
 
             // If no active connections, stop immediately
             if (!$hasActiveConnections) {
-                static::$globalEvent?->stop();
-                if ($thisWorker = reset(static::$workers)) {
-                    $thisWorker->onWorkerStop?->__invoke($thisWorker);
-                }
-                exit($status);
+                static::exitWorker($status);
             }
 
             // Schedule forced exit after stopTimeout seconds
@@ -1018,14 +1054,34 @@ class Worker
                     if ($gracefulTimerId !== null) {
                         static::$globalEvent?->offRepeat($gracefulTimerId);
                     }
-                    static::$globalEvent?->stop();
-                    if ($thisWorker = reset(static::$workers)) {
-                        $thisWorker->onWorkerStop?->__invoke($thisWorker);
-                    }
-                    exit($status);
+                    static::exitWorker($status);
                 }
             });
         }
+    }
+
+    /**
+     * 退出 worker 进程前的统一收尾。
+     *
+     * 顺序：停事件循环 → 触发 onWorkerStop（应用回调可能仍需访问数据库/Redis）
+     * → 释放连接池 → 退出。释放池必须在应用回调之后、exit 之前：
+     * 否则优雅关闭窗口内维护定时器仍在跑心跳，且连接不经关闭命令就随进程消失。
+     */
+    protected static function exitWorker(int $status): void
+    {
+        static::$globalEvent?->stop();
+
+        try {
+            if ($thisWorker = reset(static::$workers)) {
+                $thisWorker->onWorkerStop?->__invoke($thisWorker);
+            }
+        } catch (Throwable $e) {
+            static::log('onWorkerStop error: ' . $e);
+        } finally {
+            \LarkFrame\Coroutine\Pool::closeAllInstances();
+        }
+
+        exit($status);
     }
 
     /**
@@ -1071,7 +1127,11 @@ class Worker
      */
     public static function log(string|Throwable $message): void
     {
-        $message = (string)$message;
+        // 折叠换行：message 常源自异常文本或用户输入，含 CR/LF 会在日志文件（含 daemon 下的
+        // stdoutFile）里伪造出额外日志行、破坏按行解析。语义与 LogFormatter::replaceNewlines
+        // 的默认分支一致（替换为空格）。safeEcho 自身不清洗——它还要输出多行的 usage 文本。
+        $message = str_replace(["\r\n", "\r", "\n"], ' ', (string)$message);
+
         if (static::$logFile === '' || static::$logFile === '/dev/null') {
             static::safeEcho($message);
             return;

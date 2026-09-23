@@ -249,7 +249,17 @@ class Http
                 }
             }
 
-            if ($dataStart + $chunkSize + 2 > $bufLen) {
+            $nextPos = $dataStart + $chunkSize + 2;
+
+            // 必须先判上限再判数据是否收齐：若顺序颠倒，攻击者声明一个超大 chunk 后缓慢滴数据，
+            // recvBuffer 会一路增长到声明值——chunked 未收完时 currentPackageLength 恒为 0，
+            // TcpConnection::processProtocolData 的 maxPackageSize 保护不生效，最终 OOM
+            if ($nextPos > $maxSize) {
+                $connection->end(static::HTTP_413, true);
+                return 0;
+            }
+
+            if ($nextPos > $bufLen) {
                 // chunk 数据未收完：游标停留在本 chunk-size 行首，下次从此处续扫
                 $connection->context->chunkedScanPos = $lineStart;
                 return 0;
@@ -259,11 +269,7 @@ class Http
                 return 0;
             }
 
-            $pos = $dataStart + $chunkSize + 2;
-            if ($pos > $maxSize) {
-                $connection->end(static::HTTP_413, true);
-                return 0;
-            }
+            $pos = $nextPos;
             $connection->context->chunkedScanPos = $pos;
         }
     }

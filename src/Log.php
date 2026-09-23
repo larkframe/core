@@ -6,7 +6,6 @@ use Monolog\Formatter\FormatterInterface;
 use Monolog\Handler\FormattableHandlerInterface;
 use Monolog\Handler\HandlerInterface;
 use Monolog\Logger;
-use function array_values;
 use function config;
 use function is_array;
 
@@ -70,8 +69,11 @@ class Log
         $handlerConfigs = $config['handlers'] ?? [];
         // 显式配置为空数组同样回退默认（?? 不会命中空数组，会把所有日志静默丢弃）
         if ($handlerConfigs === []) {
+            // 参数顺序：stream, level, bubble, filePermission, useLocking。
+            // 末位 useLocking 必须为 true：多 worker（count > 1 或 reusePort）会并发写同一
+            // 日志文件，无 flock 时单条日志可能被其他进程的写入截断，出现行撕裂/内容交错
             $handlerConfigs = [
-                ['class' => \Monolog\Handler\StreamHandler::class, 'constructor' => [runtime_path('logs/app.log'), $defaultLevel]]
+                ['class' => \Monolog\Handler\StreamHandler::class, 'constructor' => [runtime_path('logs/app.log'), $defaultLevel, true, null, true]]
             ];
         }
         $handlers = [];
@@ -119,13 +121,18 @@ class Log
 
     /**
      * 解析构造参数：Closure 项在实例化时调用（延迟求值），其余原样返回。
+     *
+     * 保留原始键：字符串键会作为 PHP 命名参数传给构造函数，用户可写
+     * `['stream' => ..., 'useLocking' => true]` 而不必记住参数位置。
+     * 原实现用 array_values 强制位置传参，命名参数配置会被按数组顺序错绑。
      */
     protected static function resolveConstructor(array $constructor): array
     {
-        return array_map(
-            static fn(mixed $arg): mixed => $arg instanceof \Closure ? $arg() : $arg,
-            array_values($constructor)
-        );
+        $resolved = [];
+        foreach ($constructor as $key => $arg) {
+            $resolved[$key] = $arg instanceof \Closure ? $arg() : $arg;
+        }
+        return $resolved;
     }
 
     /**

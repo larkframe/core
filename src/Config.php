@@ -47,7 +47,9 @@ class Config
             throw new Exception("env file error: $filePath");
         }
 
-        $lines = file($filePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        // 不用 FILE_SKIP_EMPTY_LINES：多行引号值内部的空行属于值内容，
+        // 提前过滤会静默改变值；空行改在循环内按解析状态判断
+        $lines = file($filePath, FILE_IGNORE_NEW_LINES);
         if ($lines === false) {
             throw new Exception("env load error: $filePath");
         }
@@ -57,65 +59,67 @@ class Config
         $quoteChar = '';
         $currentKey = null;
         $currentValue = '';
+        // 值是否被引号包裹：决定是否跳过行内注释剥离与类型转换（dotenv 语义下引号值恒为字符串）
+        $quoted = false;
 
         foreach ($lines as $line) {
-            if (str_starts_with(trim($line), '#')) {
-                continue;
-            }
-
-            if ($inQuote) {
-                // 闭合检测必须与开启引号类型一致，否则 KEY="abc' 会被误判为闭合
-                $escaped = preg_quote($quoteChar, '/');
-                if (preg_match('/(?<![\\\\])' . $escaped . '\s*$/', $line, $matches)) {
-                    $inQuote = false;
-                    // 截取到最后一个匹配引号的位置
-                    $pos = strrpos($line, $quoteChar);
-                    $currentValue .= "\n" . substr($line, 0, $pos);
-                } else {
-                    $currentValue .= "\n" . $line;
+            if (!$inQuote) {
+                $trimmed = trim($line);
+                // 引号态内的空行是值内容，只在非引号态跳过注释行与空行
+                if ($trimmed === '' || str_starts_with($trimmed, '#')) {
                     continue;
                 }
-            } else {
+
                 $parts = explode('=', $line, 2);
                 if (count($parts) !== 2) {
                     continue;
                 }
 
-                $currentKey = trim($parts[0]);
-                $value = trim($parts[1]);
-
-                if (preg_match('/^([\'"])(.*)(?<![\\\\])\1$/', $value, $matches)) {
-                    $currentValue = $matches[2];
-                } elseif (preg_match('/^([\'"])(.*)$/', $value, $matches)) {
-                    $inQuote = true;
-                    $quoteChar = $matches[1];
-                    $currentValue = $matches[2];
+                $currentKey = self::parseEnvKey($parts[0]);
+                if ($currentKey === null) {
                     continue;
+                }
+
+                $value = trim($parts[1]);
+                $quoted = false;
+
+                if ($value !== '' && ($value[0] === '"' || $value[0] === "'")) {
+                    $quoteChar = $value[0];
+                    $quoted = true;
+                    [$closed, $content] = self::splitAtClosingQuote(substr($value, 1), $quoteChar);
+                    $currentValue = $content;
+                    if (!$closed) {
+                        // 引号未闭合：进入多行模式，后续行继续累积
+                        $inQuote = true;
+                        continue;
+                    }
                 } else {
                     $currentValue = $value;
                 }
+            } else {
+                // 多行引号值：每行查找闭合引号，未闭合则继续累积
+                [$closed, $content] = self::splitAtClosingQuote($line, $quoteChar);
+                $currentValue .= "\n" . $content;
+                if (!$closed) {
+                    continue;
+                }
+                $inQuote = false;
             }
 
-            $currentValue = preg_replace_callback('/\\\\([nrtvf\\\\$"\']|u([0-9a-fA-F]{4}))/',
-                function ($matches) {
-                    $escapes = [
-                        'n' => "\n", 'r' => "\r", 't' => "\t",
-                        'v' => "\v", 'f' => "\f", '\\\\' => "\\",
-                        '$' => '$', '"' => '"', "'" => "'"
-                    ];
-                    return $escapes[$matches[1]] ?? (isset($matches[2])
-                        ? json_decode('"\u' . $matches[2] . '"')
-                        : $matches[0]);
-                },
-                $currentValue
-            );
+            // 值已完整取出
+            $currentValue = self::unescapeEnvValue($currentValue, $quoted, $quoteChar);
 
-            if (!$inQuote) {
+            // 行内注释仅对未加引号的值生效：引号内的 # 是值的一部分
+            if (!$quoted) {
                 $currentValue = preg_replace('/\s+#.*$/', '', $currentValue);
             }
 
-            $env[$currentKey] = self::castEnvValue($currentValue);
+            // 引号值恒为字符串；裸值按字面量推断类型
+            $env[$currentKey] = $quoted ? $currentValue : self::castEnvValue($currentValue);
+
             $currentValue = '';
+            $quoted = false;
+            $quoteChar = '';
         }
 
         if ($inQuote) {
@@ -123,7 +127,77 @@ class Config
         }
 
         return $env;
+    }
 
+    /**
+     * 解析键名：去除空白与 dotenv 可选的 export 前缀。
+     *
+     * @return string|null null 表示该行不是有效的键值对
+     */
+    private static function parseEnvKey(string $rawKey): ?string
+    {
+        $key = trim($rawKey);
+        if (str_starts_with($key, 'export ')) {
+            $key = trim(substr($key, 7));
+        }
+        return $key === '' ? null : $key;
+    }
+
+    /**
+     * 查找引号闭合位置，返回引号之前的内容。
+     *
+     * 反斜杠转义按**连续反斜杠的奇偶**判定：`"a\\"` 引号前是 2 个（偶数）→ 闭合，
+     * `"a\"` 是 1 个（奇数）→ 被转义、不闭合。原实现用 (?<![\\]) 只排除单个反斜杠，
+     * 会把 `KEY="v\\"` 误判为未闭合，进而吞掉后续所有行直至抛错。
+     * 单引号内反斜杠无转义语义（dotenv 语义），任何位置的引号都视为闭合。
+     *
+     * @return array{0: bool, 1: string} [是否闭合, 引号之前的内容]
+     */
+    private static function splitAtClosingQuote(string $str, string $quoteChar): array
+    {
+        $len = strlen($str);
+        for ($i = 0; $i < $len; $i++) {
+            if ($str[$i] !== $quoteChar) {
+                continue;
+            }
+            if ($quoteChar === "'") {
+                return [true, substr($str, 0, $i)];
+            }
+            $backslashes = 0;
+            for ($j = $i - 1; $j >= 0 && $str[$j] === '\\'; $j--) {
+                $backslashes++;
+            }
+            if ($backslashes % 2 === 0) {
+                return [true, substr($str, 0, $i)];
+            }
+        }
+        return [false, $str];
+    }
+
+    /**
+     * 还原转义序列。
+     *
+     * 单引号值按 dotenv 语义为字面量，不做转义还原；双引号值与裸值保持既有行为。
+     */
+    private static function unescapeEnvValue(string $value, bool $quoted, string $quoteChar): string
+    {
+        if ($quoted && $quoteChar === "'") {
+            return $value;
+        }
+
+        return preg_replace_callback('/\\\\([nrtvf\\\\$"\']|u([0-9a-fA-F]{4}))/',
+            function ($matches) {
+                $escapes = [
+                    'n' => "\n", 'r' => "\r", 't' => "\t",
+                    'v' => "\v", 'f' => "\f", '\\' => "\\",
+                    '$' => '$', '"' => '"', "'" => "'"
+                ];
+                return $escapes[$matches[1]] ?? (isset($matches[2])
+                    ? json_decode('"\u' . $matches[2] . '"')
+                    : $matches[0]);
+            },
+            $value
+        );
     }
     /**
      * 清理中央配置缓存。

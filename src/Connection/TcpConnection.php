@@ -716,7 +716,13 @@ class TcpConnection
         unset(self::$connections[$this->id]);
 
         // onClose callback.
-        $this->onClose?->__invoke($this);
+        if ($this->onClose !== null) {
+            try {
+                ($this->onClose)($this);
+            } catch (Throwable $e) {
+                $this->error($e);
+            }
+        }
 
         $this->onMessage = null;
         $this->onClose = null;

@@ -116,27 +116,36 @@ push → [主队列] → pop → [reserved] → ack → 完成
 
 ## 可靠性保证
 
-### 原子 pop + reserve
+### 原子 pop + 迁移 + reserve
 
-`pop()` 通过 Lua 脚本原子完成 `LPOP` + `ZADD(reserved)`，避免进程崩溃在两步之间导致任务丢失。Lua 脚本内 `cjson.decode` 包裹 `pcall`，若 payload 损坏则自动推入 `:failed` 队列并返回 nil，不丢失原始数据。
+`pop()` 通过**单个** Lua 脚本（`POP_MIGRATE_AND_RESERVE_LUA`）完成三件事：
+
+1. 把到期的延迟任务从 `:delayed` 迁移到主队列
+2. 把 reserved 中超时未确认的任务迁回主队列
+3. `LPOP` 主队列并 `ZADD` 到 reserved（score = now + retry_after）
+
+合并为单脚本后每次 pop 只需 **1 次 Redis RTT**（原实现为 3 次），且迁移与取出在同一脚本内天然互斥，多 Worker 并发迁移不会重复消费。Lua 脚本内 `cjson.decode` 包裹 `pcall`，若 payload 损坏则自动推入 `:failed` 队列并返回 nil，不丢失原始数据。单次迁移批量上限 100，避免脚本执行过长阻塞 Redis。
 
 ### ack 精确匹配
 
 `Job` 构造时保存 Lua `cjson.encode` 的原始字符串作为 `rawPayload`，`ack()` 使用它与 reserved ZSET 成员精确匹配。避免 PHP `json_encode` 与 Lua `cjson.encode` 编码差异（如 Unicode 转义、键序）导致 `zRem` 失败。
 
-### fail/release 顺序
+### fail/release 原子性
 
-`fail()` 和 `release()` 均采用 **先 push 后 ack** 策略（at-least-once 语义）：
-- 先将任务写入目标队列（`:failed` 或主队列/`:delayed`）
-- 再从 reserved ZSET 移除
+`fail()` 与 `release()` 各自通过单个 Lua 脚本（`ACK_AND_PUSH_LIST_LUA` / `ACK_AND_PUSH_DELAYED_LUA`）原子完成「从 reserved 移除 + 推入目标队列」，消除两步之间崩溃导致任务同时存在于两处、被重复消费的窗口。
 
-若 `ack` 失败，任务可能在 reserved 超时后被重新迁移到主队列，导致重复消费——这优于任务丢失。
+脚本仅在 `ZREM` 命中（即仍持有该任务的预留）时才推入目标队列。若预留已超时并被其他 Worker 迁回主队列，`ZREM` 返回 0，此时不推入——避免任务同时存在于主队列与 `:failed` 而被重复消费。
 
 ### 序列化安全
 
 - `createPayload()` 使用 `JSON_THROW_ON_ERROR`，编码失败时抛出异常而非静默推空字符串
-- `Job::fire()` 中 `unserialize` 显式指定 `allowed_classes => true`，不再使用 `@` 抑制错误
+- `Job::fire()` 中 `unserialize` 默认 `allowed_classes => []`，仅允许数组/标量；需要反序列化对象任务时通过 `queue.allowed_job_classes` 显式声明白名单，避免任意类实例化（RCE）
 
-### 批量迁移
+### 重试与失败判定
 
-`migrateExpiredJobs()` 通过 Lua 脚本原子完成 `ZRANGEBYSCORE` + `ZREMRANGEBYRANK` + `RPUSH`，单次批量上限 100，避免并发 Worker 重复迁移。
+`Queue\Worker::processJob()` 为任务处理的统一入口（阻塞式 daemon 循环与事件循环消费任务共用），`max_tries` 判定语义：
+
+- `attempts + 1 >= max_tries` → 本次是最后一次允许的执行，失败即 `fail($e)`，异常根因写入 `:failed` 的 `error` 字段
+- 否则 → `release($sleep)` 重试
+
+`attempts` 在 release 时递增，故第 N 次执行时 `attempts == N - 1`。

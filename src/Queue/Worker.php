@@ -167,7 +167,11 @@ class Worker
     {
         Log::error("Job {$job->getName()} failed: " . $e->getMessage(), ['exception' => $e]);
 
-        if ($job->hasExceededMaxTries($this->maxTries)) {
+        // attempts 在 release 时递增，故本次是第 (attempts + 1) 次执行；
+        // 达到 max_tries 时直接判失败，把本次异常写入 failed 队列。
+        // 原判定用 hasExceededMaxTries（attempts >= maxTries）：因 process() 已在
+        // attempts 达阈值时短路，该分支永远不可达，导致最后一次失败原因无法落库。
+        if ($job->getAttempts() + 1 >= $this->maxTries) {
             $job->fail($e);
         } else {
             // 空闲轮询间隔同时充当重试延迟（与 Laravel queue:work --sleep 同款约定）：

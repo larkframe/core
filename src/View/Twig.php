@@ -29,6 +29,21 @@ class Twig implements View
      */
     public static function render(string $template, array $vars, ?string $viewSuffix = null): string
     {
+        try {
+            return static::doRender($template, $vars, $viewSuffix);
+        } finally {
+            // 必须覆盖所有退出路径（含模板缺失、缓存目录创建失败等前置抛出）：
+            // ViewVarHolder::$vars 是静态属性，异常时残留的上一请求变量
+            // 会被合并进下一个请求的渲染变量（跨请求数据泄漏）
+            ViewVarHolder::clear();
+        }
+    }
+
+    /**
+     * 实际渲染逻辑（异常由 render() 统一兜底并清理变量表）。
+     */
+    private static function doRender(string $template, array $vars, ?string $viewSuffix): string
+    {
         static $views = [];
         if ($viewSuffix == null) {
             $viewSuffix = config("view.options.view_suffix", 'html');
@@ -59,11 +74,6 @@ class Twig implements View
         // Merge view vars from holder with render-time vars
         $allVars = array_merge(ViewVarHolder::getVars(), $vars);
 
-        $result = $views[$viewPath]->render("$template.$viewSuffix", $allVars);
-
-        // Clear assigned vars after rendering
-        ViewVarHolder::clear();
-
-        return $result;
+        return $views[$viewPath]->render("$template.$viewSuffix", $allVars);
     }
 }

@@ -33,46 +33,55 @@ class Raw implements View
      */
     public static function render(string $template, array $vars, ?string $viewSuffix = null): string
     {
-        if ($viewSuffix == null) {
-            $viewSuffix = config("view.options.view_suffix", 'php');
-        }
+        // 缓冲开启标记：异常路径需按实际是否已开启来决定是否收尾，避免 ob 配对错乱
+        $bufferStarted = false;
 
-        $templateDir = ROOT_PATH . DIRECTORY_SEPARATOR . 'template';
-        $__template_path__ = $templateDir . DIRECTORY_SEPARATOR . $template . '.' . $viewSuffix;
-
-        // 防路径穿越：$template 含 ../ 时可 include 模板目录之外的任意 PHP 文件（LFI），
-        // 真实路径必须仍位于模板目录内；is_file 同时排除目录误判（P2-22）
-        $realTemplateDir = realpath($templateDir);
-        $realPath = realpath($__template_path__);
-        if ($realTemplateDir === false || $realPath === false
-            || !str_starts_with($realPath, $realTemplateDir . DIRECTORY_SEPARATOR)
-            || !is_file($realPath)) {
-            throw new RuntimeException("Template not found: {$template}.{$viewSuffix} (path: {$__template_path__})");
-        }
-        $__template_path__ = $realPath;
-
-        $allVars = array_merge(ViewVarHolder::getVars(), $vars);
-
-        ob_start();
-        // P2-23 方案 B：用闭包隔离模板变量作用域，避免 extract 出的变量污染 render 方法作用域，
-        // 也避免 render 方法内的临时变量（$__template_path__ 等）被模板变量覆盖。
-        // EXTR_SKIP: 不覆盖闭包内已定义的 $__template_path__ 与 $__vars__，防止任意文件包含。
-        $render = static function (string $__template_path__, array $__vars__): void {
-            extract($__vars__, EXTR_SKIP);
-            include $__template_path__;
-        };
         try {
+            if ($viewSuffix == null) {
+                $viewSuffix = config("view.options.view_suffix", 'php');
+            }
+
+            $templateDir = ROOT_PATH . DIRECTORY_SEPARATOR . 'template';
+            $__template_path__ = $templateDir . DIRECTORY_SEPARATOR . $template . '.' . $viewSuffix;
+
+            // 防路径穿越：$template 含 ../ 时可 include 模板目录之外的任意 PHP 文件（LFI），
+            // 真实路径必须仍位于模板目录内；is_file 同时排除目录误判（P2-22）
+            $realTemplateDir = realpath($templateDir);
+            $realPath = realpath($__template_path__);
+            if ($realTemplateDir === false || $realPath === false
+                || !str_starts_with($realPath, $realTemplateDir . DIRECTORY_SEPARATOR)
+                || !is_file($realPath)) {
+                throw new RuntimeException("Template not found: {$template}.{$viewSuffix} (path: {$__template_path__})");
+            }
+            $__template_path__ = $realPath;
+
+            $allVars = array_merge(ViewVarHolder::getVars(), $vars);
+
+            ob_start();
+            $bufferStarted = true;
+
+            // P2-23 方案 B：用闭包隔离模板变量作用域，避免 extract 出的变量污染 render 方法作用域，
+            // 也避免 render 方法内的临时变量（$__template_path__ 等）被模板变量覆盖。
+            // EXTR_SKIP: 不覆盖闭包内已定义的 $__template_path__ 与 $__vars__，防止任意文件包含。
+            $render = static function (string $__template_path__, array $__vars__): void {
+                extract($__vars__, EXTR_SKIP);
+                include $__template_path__;
+            };
             $render($__template_path__, $allVars);
+
+            $result = ob_get_clean();
+            $bufferStarted = false;
+
+            return $result;
         } catch (Throwable $e) {
-            ob_end_clean();
+            if ($bufferStarted) {
+                ob_end_clean();
+            }
             throw $e;
+        } finally {
+            // 必须覆盖所有退出路径（含路径校验阶段抛出）：ViewVarHolder::$vars 是静态属性，
+            // 异常时残留的上一请求变量会被合并进下一个请求的渲染变量（跨请求数据泄漏）
+            ViewVarHolder::clear();
         }
-
-        $result = ob_get_clean();
-
-        // Clear assigned vars after rendering
-        ViewVarHolder::clear();
-
-        return $result;
     }
 }

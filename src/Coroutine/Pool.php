@@ -87,6 +87,14 @@ class Pool implements PoolInterface
     private readonly bool $forceCoroutineMode;
 
     /**
+     * 已创建的池实例（弱引用注册表，不阻止 GC）。
+     * 供 Worker 在进程退出前统一释放连接与维护定时器，见 closeAllInstances()。
+     *
+     * @var WeakMap<self, true>|null
+     */
+    private static ?WeakMap $instances = null;
+
+    /**
      * Constructor with property promotion for config values.
      *
      * @param array $config 原始配置（fromConfig 解析后各字段已展开为独立参数，此参数仅为位置兼容保留）
@@ -107,6 +115,9 @@ class Pool implements PoolInterface
         $this->connectionStatus = new WeakMap();
         $this->createdAt = new WeakMap();
         $this->forceCoroutineMode = $forceCoroutineMode;
+
+        self::$instances ??= new WeakMap();
+        self::$instances[$this] = true;
     }
 
     /**
@@ -168,23 +179,9 @@ class Pool implements PoolInterface
     {
         // Non-coroutine: reuse a single connection with heartbeat validation
         if (!$this->isCoroutine()) {
-            // 已有连接则用心跳回调校验活性，避免返回已被服务端关闭的死连接。
-            // 按 heartbeat_interval 节流：原实现每次 get() 都探测，等于给每个操作多加一次网络往返
-            // （Redis PING / MySQL ping）；heartbeat_interval <= 0 视为未配置节流，保持每次都探测，
-            // 不引入活性校验空窗。
-            $conn = $this->nonCoroutineConnection;
-            if ($conn !== null && $this->connectionHeartbeatHandler !== null) {
-                $shouldProbe = $this->heartbeatInterval <= 0
-                    || (microtime(true) - ($this->lastHeartbeatTimes[$conn] ?? 0.0)) >= $this->heartbeatInterval;
-                if ($shouldProbe) {
-                    try {
-                        ($this->connectionHeartbeatHandler)($conn);
-                        $this->lastHeartbeatTimes[$conn] = microtime(true);
-                    } catch (Throwable) {
-                        $this->closeConnection($conn);
-                        $this->nonCoroutineConnection = null;
-                    }
-                }
+            if ($this->nonCoroutineConnection !== null) {
+                // 失效连接由 closeConnection 内部置空 nonCoroutineConnection
+                $this->probeOnAcquire($this->nonCoroutineConnection);
             }
             if ($this->nonCoroutineConnection === null) {
                 $this->nonCoroutineConnection = $this->createConnection();
@@ -209,16 +206,63 @@ class Pool implements PoolInterface
             }
         }
 
-        $connection = $this->channel->pop($this->waitTimeout);
+        // 仅真 Fiber 环境可挂起等待；非 Fiber 下 channel 的等待由 usleep 轮询实现，
+        // 会阻塞整个事件循环直到 waitTimeout——而同步上下文里不可能"稍后有人归还"
+        // （同一时刻只有一个执行流），等待没有收益。故改为非阻塞取用 + 立即失败：
+        // 池耗尽快速暴露并给出诊断，而不是拖垮整个 worker 的事件循环。
+        $canSuspend = $this->canSuspend();
+        $connection = $this->channel->pop($canSuspend ? $this->waitTimeout : 0.0);
         if (!$connection) {
-            throw new PoolException(
-                "Failed to get a connection from the pool within the wait timeout ({$this->waitTimeout} seconds). The connection pool is exhausted."
-            );
+            throw new PoolException($canSuspend
+                ? "Failed to get a connection from the pool within the wait timeout ({$this->waitTimeout} seconds). The connection pool is exhausted."
+                : 'No idle connection available and the pool has reached max_connections. '
+                    . 'Waiting is not possible outside a Fiber context because it would block the event loop. '
+                    . 'This usually indicates leaked connections (borrowed but never returned) or an undersized pool.');
+        }
+
+        // 协程路径同样需要借出前校验：空闲连接的心跳只在定时器中做（间隔
+        // heartbeat_interval），借出期间被服务端 wait_timeout/网络中断断开的连接
+        // 会原样交给调用方，表现为 MySQL "server has gone away" / Redis 连接错误。
+        // 与新建路径一致：失效连接关闭后重建，计数已减 1 故不会触及 maxConnections 上限。
+        if (!$this->probeOnAcquire($connection)) {
+            $connection = $this->createConnection();
         }
 
         $this->lastUsedTimes[$connection] = microtime(true);
         $this->connectionStatus[$connection] = ConnectionStatus::Active;
         return $connection;
+    }
+
+    /**
+     * 借出前按 heartbeat_interval 节流做活性探测，剔除已被服务端关闭的死连接。
+     *
+     * 节流是必要的：连接刚建立/刚探测过（lastHeartbeatTimes 由 registerConnection 初始化）
+     * 时无需再探测，否则等于给每次借出多加一次网络往返（Redis PING / MySQL ping）。
+     * heartbeat_interval <= 0 视为未配置节流，每次借出都探测，不引入活性校验空窗。
+     *
+     * @return bool true=连接可用；false=连接已失效并被移出池（调用方需重建）
+     */
+    protected function probeOnAcquire(object $connection): bool
+    {
+        if ($this->connectionHeartbeatHandler === null) {
+            return true;
+        }
+
+        $now = microtime(true);
+        if ($this->heartbeatInterval > 0
+            && ($now - ($this->lastHeartbeatTimes[$connection] ?? 0.0)) < $this->heartbeatInterval) {
+            return true;
+        }
+
+        try {
+            ($this->connectionHeartbeatHandler)($connection);
+            $this->lastHeartbeatTimes[$connection] = $now;
+            return true;
+        } catch (Throwable $e) {
+            $this->closeConnection($connection);
+            $this->log("Stale connection discarded on acquire: " . $e->getMessage());
+            return false;
+        }
     }
 
     /**
@@ -386,6 +430,17 @@ class Pool implements PoolInterface
     }
 
     /**
+     * 当前是否处于可挂起的 Fiber 环境。
+     *
+     * 与 isCoroutine() 的区别：后者决定"走池还是走单连接"（Server 模式恒为池），
+     * 本方法只回答"能否挂起等待"，二者不可互相替代。
+     */
+    protected function canSuspend(): bool
+    {
+        return class_exists(Fiber::class) && Fiber::getCurrent() !== null;
+    }
+
+    /**
      * Log a message.
      */
     protected function log(mixed $message): void
@@ -432,6 +487,34 @@ class Pool implements PoolInterface
         if ($this->heartbeatTimerId !== null) {
             $eventLoop->offRepeat($this->heartbeatTimerId);
             $this->heartbeatTimerId = null;
+        }
+    }
+
+    /**
+     * 释放所有池实例：停止维护定时器并关闭全部连接。
+     *
+     * 由 Worker 在进程退出前调用（见 Worker::exitWorker）。必要性有两点：
+     *   1. 优雅关闭的等待窗口内维护定时器仍在事件循环中，会继续对空闲连接发心跳；
+     *   2. 不发关闭命令直接退出，会让服务端把连接挂到各自的 wait_timeout 才回收
+     *      （多 worker 滚动重启时表现为服务端连接数堆积）。
+     */
+    public static function closeAllInstances(): void
+    {
+        if (self::$instances === null) {
+            return;
+        }
+
+        $eventLoop = \LarkFrame\Worker::$globalEvent;
+        foreach (self::$instances as $pool => $_) {
+            try {
+                if ($eventLoop !== null) {
+                    $pool->stopMaintenance($eventLoop);
+                }
+                $pool->closeConnections();
+            } catch (Throwable $e) {
+                // 单个池释放失败不应阻断其他池与后续退出流程
+                $pool->log('Failed to close connection pool on shutdown: ' . $e->getMessage());
+            }
         }
     }
 

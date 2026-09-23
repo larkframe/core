@@ -79,6 +79,17 @@ class Rand
         }
 
         $charactersLength = strlen($characters);
+
+        // 字符集超过 256 字节时单字节拒绝采样不可用：validRange 会归零导致 ord($byte) < 0 恒假，
+        // while 循环永不退出（worker 挂死）。改用 random_int 逐字符取值，同样无模偏差。
+        if ($charactersLength > 256) {
+            $result = '';
+            for ($i = 0; $i < $length; $i++) {
+                $result .= $characters[random_int(0, $charactersLength - 1)];
+            }
+            return $result;
+        }
+
         // 拒绝采样消除模偏差：ord % len 在 256 % len != 0 时前若干字符概率偏高，
         // 该方法用于验证码/token 生成，熵损耗必须消除
         $validRange = intdiv(256, $charactersLength) * $charactersLength;

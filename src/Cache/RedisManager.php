@@ -127,15 +127,4 @@ class RedisManager extends \Illuminate\Redis\RedisManager
     {
         $this->config[$name] = $config;
     }
-
-    /**
-     * Start pool maintenance timers for all pools.
-     * Should be called in onWorkerStart after the event loop is ready.
-     */
-    public static function startPoolMaintenance(\LarkFrame\Events\EventInterface $eventLoop): void
-    {
-        foreach (static::$pools as $pool) {
-            $pool->startMaintenance($eventLoop);
-        }
-    }
 }

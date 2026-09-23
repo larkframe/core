@@ -82,6 +82,22 @@ class Request implements Stringable
     protected array $data = [];
 
     /**
+     * 本请求 multipart 解析产生的临时文件路径集合。
+     *
+     * Server/Task 模式下手工解析上传体，临时文件由 tempnam 落盘；PHP 不会像 FPM 那样
+     * 在请求结束时自动回收，业务未调用 UploadFile::move() 的路径（校验失败、只读内容、
+     * 异常中断）会把文件永久留在临时目录造成磁盘泄漏，故在此登记并在请求结束时清理。
+     *
+     * @var array<string, true>
+     */
+    protected array $tmpUploadFiles = [];
+
+    /**
+     * 是否已注册请求结束清理回调。
+     */
+    protected bool $tmpUploadCleanupRegistered = false;
+
+    /**
      * Is safe.
      */
     protected bool $isSafe = true;
@@ -658,6 +674,8 @@ class Request implements Stringable
                 $tmpFile = tempnam($tmpUploadDir, 'lark.upload.');
                 if ($tmpFile === false || false === file_put_contents($tmpFile, $boundaryValue)) {
                     $error = UPLOAD_ERR_CANT_WRITE;
+                } else {
+                    $this->registerTmpUploadFile($tmpFile);
                 }
             }
             $uploadKey = $fileName;
@@ -679,6 +697,36 @@ class Request implements Stringable
     public function setChunkTrailers(array $trailers): void
     {
         $this->data['trailers'] = $trailers;
+    }
+
+    /**
+     * 登记上传临时文件，并确保请求结束时统一清理。
+     *
+     * 清理回调经 Context::onDestroy 注册：App::send()（Server 模式）与 runAsNormal 的
+     * finally（Web/Shell 模式）都会触发 Context::destroy()，时机在业务 handler 执行之后，
+     * 不影响请求内的文件读取与 move()。
+     * 已 move 走的文件在清理时因 is_file() 为假而自然跳过，无需业务显式反登记。
+     */
+    public function registerTmpUploadFile(string $path): void
+    {
+        if ($path === '') {
+            return;
+        }
+        $this->tmpUploadFiles[$path] = true;
+
+        if ($this->tmpUploadCleanupRegistered) {
+            return;
+        }
+        $this->tmpUploadCleanupRegistered = true;
+
+        Context::onDestroy(function (): void {
+            foreach ($this->tmpUploadFiles as $tmp => $_) {
+                if (is_file($tmp)) {
+                    @unlink($tmp);
+                }
+            }
+            $this->tmpUploadFiles = [];
+        });
     }
 
     public function __toString(): string

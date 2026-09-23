@@ -104,11 +104,12 @@ class App
             if (isset(static::$callbacks[$key])) {
                 // Move to end of LRU (most recently used) — O(1) via doubly-linked list
                 static::lruTouch($key);
-                [$callback, $controller, $action, $route] = static::$callbacks[$key];
+                [$call, $args, $controller, $action, $route] = static::$callbacks[$key];
                 $request->setController($controller);
                 $request->setAction($action);
                 $request->setRoute($route);
-                static::send($connection, $callback($request), $request);
+                // controller 实例于请求时重建，避免缓存闭包复用上一请求实例导致跨请求状态污染
+                static::send($connection, static::getCallback($call, $args, $route)($request), $request);
                 return;
             }
 
@@ -360,8 +361,13 @@ HTML;
 
     /**
      * Get current request.
+     *
+     * 非 HTTP 上下文（队列消费、定时任务、CLI）无当前请求，返回 null。
+     * 返回类型必须可空：LogFormatter（$requestObj !== null）、Response::file（$request !== null）、
+     * Database\Initializer（request()?->）等调用点均按可空处理，声明为非空会在
+     * 队列/任务写日志时抛 TypeError 直接崩溃。
      */
-    public static function request(): \LarkFrame\Request
+    public static function request(): ?\LarkFrame\Request
     {
         return Context::get(\LarkFrame\Request::class);
     }

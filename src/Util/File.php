@@ -67,7 +67,8 @@ class File
         if ($entries === false) {
             return [];
         }
-        $paths = array_diff($entries, ['.', '..']);
+        // array_values：array_diff/array_map 保留原键，键不连续时 json_encode 会输出对象而非数组
+        $paths = array_values(array_diff($entries, ['.', '..']));
         return $withBasePath ? array_map(static fn($path) => $basePath . DIRECTORY_SEPARATOR . $path, $paths) : $paths;
     }
 
