@@ -7,7 +7,6 @@ use Twig\Environment;
 use Twig\Loader\FilesystemLoader;
 use function array_merge;
 use function config;
-use function is_array;
 
 class Twig implements View
 {
@@ -35,14 +34,16 @@ class Twig implements View
             $viewSuffix = config("view.options.view_suffix", 'html');
         }
         $viewPath = ROOT_PATH . DIRECTORY_SEPARATOR . "template" . DIRECTORY_SEPARATOR;
-        if (!file_exists($viewPath . $template . "." . $viewSuffix)) {
-            return "template " . $template . "." . $viewSuffix . " not found";
+        // 与 Raw 引擎行为对齐：缺失模板抛异常 fail-fast，而不是以 HTTP 200 返回错误文案
+        // is_file 排除目录误判（file_exists 对目录也返回 true）
+        if (!is_file($viewPath . $template . "." . $viewSuffix)) {
+            throw new \RuntimeException("Template not found: {$template}.{$viewSuffix} (path: {$viewPath}{$template}.{$viewSuffix})");
         }
         if (!isset($views[$viewPath])) {
             $options = config("view.options", []);
             // P2-46：未显式配置 cache 时默认开启模板编译缓存，避免每次请求重新编译
             if (!array_key_exists('cache', $options)) {
-                $cacheDir = ROOT_PATH . DIRECTORY_SEPARATOR . 'runtime' . DIRECTORY_SEPARATOR . 'twig_cache';
+                $cacheDir = runtime_path('twig_cache');
                 if (!is_dir($cacheDir) && !mkdir($cacheDir, 0755, true) && !is_dir($cacheDir)) {
                     throw new \RuntimeException("Cannot create Twig cache directory: {$cacheDir}");
                 }

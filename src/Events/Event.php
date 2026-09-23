@@ -329,7 +329,15 @@ class Event implements EventInterface
         try {
             $func(...$args);
         } catch (Throwable $e) {
-            $this->errorHandler?->__invoke($e) ?? print($e);
+            if ($this->errorHandler !== null) {
+                try {
+                    ($this->errorHandler)($e);
+                } catch (Throwable $inner) {
+                    error_log("[EventLoop] errorHandler threw: " . $inner->getMessage() . " | original: " . $e->getMessage());
+                }
+            } else {
+                error_log("[EventLoop] uncaught: " . $e->getMessage() . "\n" . $e->getTraceAsString());
+            }
         }
     }
 }

@@ -7,6 +7,8 @@ use LarkFrame\Queue\Job;
 use LarkFrame\Queue\QueueInterface;
 use LarkFrame\Queue\RedisQueue;
 
+// RedisQueue 仅供 driver() 实例化使用，门面方法统一面向 QueueInterface 契约
+
 /**
  * Queue 门面类
  *
@@ -64,8 +66,8 @@ class Queue
     /**
      * 推送任务到队列
      *
-     * @param string $queue 队列名称
-     * @param mixed $job 任务类名或闭包
+     * @param string $queue 队列名称，空串时使用配置 queue.default
+     * @param mixed $job 任务类名或可序列化对象（闭包不可序列化，请使用类名）
      * @param mixed $data 任务数据
      * @param int $delay 延迟秒数
      * @return string 任务 ID
@@ -86,7 +88,7 @@ class Queue
     /**
      * 弹出任务
      */
-    public static function pop(string $queue = 'default'): ?Job
+    public static function pop(string $queue = ''): ?Job
     {
         return static::driver()->pop($queue);
     }
@@ -94,7 +96,7 @@ class Queue
     /**
      * 获取队列大小
      */
-    public static function size(string $queue = 'default'): int
+    public static function size(string $queue = ''): int
     {
         return static::driver()->size($queue);
     }
@@ -102,7 +104,7 @@ class Queue
     /**
      * 清空队列
      */
-    public static function clear(string $queue = 'default'): void
+    public static function clear(string $queue = ''): void
     {
         static::driver()->clear($queue);
     }
@@ -110,24 +112,16 @@ class Queue
     /**
      * 获取失败任务列表
      */
-    public static function getFailedJobs(string $queue = 'default'): array
+    public static function getFailedJobs(string $queue = ''): array
     {
-        $driver = static::driver();
-        if ($driver instanceof RedisQueue) {
-            return $driver->getFailedJobs($queue);
-        }
-        return [];
+        return static::driver()->getFailedJobs($queue);
     }
 
     /**
      * 重试失败任务
      */
-    public static function retryFailed(string $queue = 'default', int $index = 0): bool
+    public static function retryFailed(string $queue = '', int $index = 0): bool
     {
-        $driver = static::driver();
-        if ($driver instanceof RedisQueue) {
-            return $driver->retryFailed($queue, $index);
-        }
-        return false;
+        return static::driver()->retryFailed($queue, $index);
     }
 }

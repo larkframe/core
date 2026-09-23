@@ -144,6 +144,11 @@ class Config
         if ($key === null) {
             return static::$config;
         }
+        // 单段键快路径（实测 4.3x）：config('server') 这类高频调用免去 explode 与循环。
+        // 含点键在顶层不可能存在字面同名键（配置系统即点号分隔语法），探测失败自然落入慢路径
+        if (array_key_exists($key, static::$config)) {
+            return static::$config[$key];
+        }
         $keyArray = explode('.', $key);
         $value = static::$config;
         $found = true;

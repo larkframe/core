@@ -39,23 +39,24 @@ Rand::uuid();
 | `endsWith($str, $suffix)` | 后缀判断 | |
 | `contains($str, $needle)` | 包含判断 | |
 | `slug($str)` | URL 友好格式 | `Hello World` → `hello-world` |
-| `formatBytes($bytes)` | 字节格式化 | `1048576` → `1 MB` |
+| `formatBytes($bytes, $iec, $precision)` | 字节格式化 | `1048576` → `1 MiB`（默认 IEC 1024 基；`$iec=false` 切换 SI 输出 `1 MB`） |
 | `random($length)` | 随机可读字符串 | |
+| `limitWords($str, $words)` | 限制单词数 | |
 
 ## Rand — 随机工具
 
 | 方法 | 说明 |
 |------|------|
-| `str($length)` | 随机字符串（字母+数字） |
+| `str($length)` | 随机字符串（字母+数字，CSPRNG + 拒绝采样，分布均匀） |
 | `strEasy($length)` | 易读随机字符串（排除 0O1lI） |
 | `numberStr($length)` | 随机数字字符串 |
-| `numberInt($min, $max)` | 随机整数 |
-| `numberFloat($min, $max, $decimals)` | 随机浮点数 |
+| `numberInt($min, $max)` | 随机整数（`$min > $max` 抛 `InvalidArgumentException`） |
+| `numberFloat($min, $max, $decimals)` | 随机浮点数（min==max 返回该值；min>max 抛异常） |
 | `uuid()` | UUID v4 |
 | `uniqid($length)` | 短唯一 ID |
 | `hex($length)` | 随机十六进制 |
 | `bool()` | 随机布尔值 |
-| `arrayPick($array, $count)` | 从数组随机选取 |
+| `arrayPick($array, $count)` | 从数组随机选取（`$count < 1` 返回空数组） |
 | `any($length, $chars)` | 自定义字符集随机字符串 |
 
 ## Base64 — 编码工具
@@ -66,18 +67,18 @@ Rand::uuid();
 | `decode($data)` | 标准 Base64 解码 |
 | `urlEncode($data)` | URL 安全 Base64 编码 |
 | `urlDecode($data)` | URL 安全 Base64 解码 |
-| `authcode($str, $op, $key, $expiry)` | 可逆加密/解密（带过期时间） |
+| `authcode($str, $op, $key, $expiry)` | 可逆加密/解密（带过期时间）；`$key` 必填，空密钥抛 `InvalidArgumentException`；本质为混淆编码而非加密，禁止用于敏感数据 |
 
 ## File — 文件工具
 
 | 方法 | 说明 |
 |------|------|
-| `copyDir($src, $dest)` | 递归复制目录 |
+| `copyDir($src, $dest, $overwrite)` | 递归复制目录（失败抛 `RuntimeException`，不静默跳过） |
 | `removeDir($dir)` | 递归删除目录 |
 | `scanDir($path)` | 扫描目录 |
-| `scanDirRecursive($dir)` | 递归扫描目录 |
-| `ensureDir($dir)` | 确保目录存在 |
-| `safeWrite($path, $content)` | 安全写入文件 |
+| `scanDirRecursive($dir)` | 递归扫描目录（返回相对 $dir 的子路径，保留目录前缀） |
+| `ensureDir($dir)` | 确保目录存在（并发安全） |
+| `safeWrite($path, $content)` | 安全写入（临时文件 + rename，避免写中断损坏） |
 | `extension($path)` | 获取扩展名 |
 | `formatSize($path)` | 人类可读文件大小 |
 | `dirSize($dir)` | 目录大小 |
@@ -98,6 +99,7 @@ $template = [
     'id' => '@id',
     'name' => '@str(8)',
     'age' => '@int(18, 60)',
+    'temp' => '@int(-5, 5)',        // 支持负数边界
     'email' => '@pick(gmail.com, qq.com, 163.com)',
     'created' => '@datetime',
     'is_active' => '@bool',
@@ -107,4 +109,6 @@ $list = Util::mock()->list($template, 10);
 // 生成 10 条模拟数据
 ```
 
-支持指令：`@id`、`@datetime`、`@date`、`@time`、`@timestamp`、`@int(min,max)`、`@float(min,max,decimals)`、`@str(length)`、`@pick(a,b,c)`、`@bool`、`@uuid`
+支持指令：`@id`、`@datetime`、`@date`、`@time`、`@timestamp`、`@int(min,max)`（含负数）、`@float(min,max,decimals)`（含负数）、`@str(length)`、`@pick(a,b,c)`、`@bool`、`@uuid`
+
+数组值配合 `key|n` 语法随机选取 n 个元素：`'tags|2' => ['a', 'b', 'c']`。

@@ -47,9 +47,12 @@ class Mock
                 $c = max(1, (int)$c);
                 $c = min($c, is_array($item) ? count($item) : 1);
                 if (is_array($item)) {
-                    $mockItem[$k] = $c !== 1
-                        ? array_rand(array_flip($item), $c)
-                        : $item[array_rand($item)];
+                    // shuffle+slice 替代 array_rand(array_flip())：
+                    // flip 要求值全为 int/string（含 null 直接 ValueError）且重复元素被去重导致概率失真
+                    $pool = $item;
+                    shuffle($pool);
+                    $picked = array_slice($pool, 0, $c);
+                    $mockItem[$k] = $c === 1 ? $picked[0] : $picked;
                 } else {
                     $mockItem[$k] = $item;
                 }
@@ -69,12 +72,9 @@ class Mock
             return $value;
         }
 
-        // @id - 自增 ID
+        // @id - 自增 ID（仅完整指令精确匹配；子串匹配会把 'user@idc.com' 之类普通文本误改写）
         if ($value === '@id') {
             return $index;
-        }
-        if (str_contains($value, '@id')) {
-            return str_replace('@id', (string)$index, $value);
         }
 
         // @datetime
@@ -107,13 +107,13 @@ class Mock
             return Rand::uuid();
         }
 
-        // @int(min,max)
-        if (preg_match('/^@int\((\d+),\s*(\d+)\)$/', $value, $matches)) {
+        // @int(min,max)（支持负数边界）
+        if (preg_match('/^@int\((-?\d+),\s*(-?\d+)\)$/', $value, $matches)) {
             return Rand::numberInt((int)$matches[1], (int)$matches[2]);
         }
 
-        // @float(min,max,decimals)
-        if (preg_match('/^@float\((\d+),\s*(\d+)(?:,\s*(\d+))?\)$/', $value, $matches)) {
+        // @float(min,max,decimals)（支持负数边界）
+        if (preg_match('/^@float\((-?\d+),\s*(-?\d+)(?:,\s*(\d+))?\)$/', $value, $matches)) {
             return Rand::numberFloat((int)$matches[1], (int)$matches[2], (int)($matches[3] ?? 2));
         }
 

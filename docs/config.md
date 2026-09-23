@@ -28,7 +28,11 @@ config/
   config.prod.php      # 生产环境覆盖
 ```
 
-环境配置会与主配置合并（`array_merge`），环境配置优先。
+环境配置会与主配置合并（顶层 `array_merge`），环境配置优先。
+
+> **注意（浅合并）**：合并仅作用于顶层键——覆盖文件中的顶层键（如 `server`）
+> 会整体替换主配置的对应键。覆盖嵌套配置时必须携带完整子结构
+> （如覆盖 `server.socketName` 需同时带上 `server.middleware`），否则未携带的子键会被清空。
 
 ## 环境变量 (.env)
 
@@ -60,3 +64,11 @@ RUN_MODE=prod
 3. `Config::load()` 加载 `config/config.php`
 4. 根据 `RUN_MODE` 加载对应环境配置
 5. Server 模式下 `onWorkerStart` 会重新加载配置
+
+### runtime_path 时序契约
+
+`config.php` 在第 3 步被 require 时配置尚未写入存储，文件内直接调用
+`runtime_path()` 只能取到默认目录（`ROOT_PATH/runtime`）。配置中的日志/缓存
+路径必须写成闭包（`fn() => runtime_path('logs/app.log')`），由 Log/Cache
+在运行期实例化时延迟求值——`app.runtime_path` 配置由此对日志与缓存目录真正生效。
+Worker/Task 的 pid/log 运行时文件在配置加载完成后解析，天然生效。

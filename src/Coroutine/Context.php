@@ -13,18 +13,30 @@ use WeakMap;
  * Coroutine-safe context storage based on PHP Fiber + WeakMap.
  * Each fiber has its own isolated context data.
  * When not in a fiber, a shared non-fiber context is used.
+ *
+ * 静态存储采用懒初始化（访问时 ??=），不依赖文件级副作用执行——
+ * opcache 预加载场景下文件只执行一次，类被预载后静态属性状态不可靠。
  */
 class Context
 {
     /**
      * Map from Fiber to ArrayObject (auto-cleaned when Fiber is GC'd).
      */
-    private static WeakMap $contexts;
+    private static ?WeakMap $contexts = null;
 
     /**
      * Context for non-fiber environment.
      */
-    private static ArrayObject $nonFiberContext;
+    private static ?ArrayObject $nonFiberContext = null;
+
+    /**
+     * 懒初始化静态存储，所有公开方法入口调用。
+     */
+    private static function boot(): void
+    {
+        self::$contexts ??= new WeakMap();
+        self::$nonFiberContext ??= new ArrayObject([], ArrayObject::ARRAY_AS_PROPS);
+    }
 
     /**
      * Get the value from the context with the specified name.
@@ -32,6 +44,7 @@ class Context
      */
     public static function get(?string $name = null, mixed $default = null): mixed
     {
+        self::boot();
         $fiber = Fiber::getCurrent();
 
         if ($fiber === null) {
@@ -54,6 +67,7 @@ class Context
      */
     public static function set(string $name, mixed $value): void
     {
+        self::boot();
         $fiber = Fiber::getCurrent();
 
         if ($fiber === null) {
@@ -70,6 +84,7 @@ class Context
      */
     public static function has(string $name): bool
     {
+        self::boot();
         $fiber = Fiber::getCurrent();
 
         if ($fiber === null) {
@@ -84,6 +99,7 @@ class Context
      */
     public static function reset(?ArrayObject $data = null): void
     {
+        self::boot();
         $data ??= new ArrayObject([], ArrayObject::ARRAY_AS_PROPS);
         $data->setFlags(ArrayObject::ARRAY_AS_PROPS);
 
@@ -100,9 +116,15 @@ class Context
     /**
      * Destroy the current context.
      * Triggers onDestroy callbacks before clearing data.
+     *
+     * 回调触发依赖引用计数而非 gc_collect_cycles：unset 移除 context 对
+     * stdClass 挂载点的引用后，WeakMap 键引用计数归零即被销毁，watcher
+     * 的 __destruct 立即执行。强制 GC 是全量根扫描（大堆下百微秒级），
+     * 会给每个注册过 onDestroy 的请求（DB/Redis 使用方）增加固定开销。
      */
     public static function destroy(): void
     {
+        self::boot();
         $fiber = Fiber::getCurrent();
 
         if ($fiber === null) {
@@ -110,7 +132,6 @@ class Context
             $onDestroyObj = self::$nonFiberContext['context.onDestroy'] ?? null;
             if ($onDestroyObj !== null) {
                 unset(self::$nonFiberContext['context.onDestroy']);
-                gc_collect_cycles();
             }
             self::$nonFiberContext = new ArrayObject([], ArrayObject::ARRAY_AS_PROPS);
             return;
@@ -123,8 +144,6 @@ class Context
             if ($onDestroyObj !== null) {
                 // Remove the reference so DestructionWatcher's WeakMap can detect it
                 unset(self::$contexts[$fiber]['context.onDestroy']);
-                // Force GC to collect the orphaned object and trigger DestructionWatcher callbacks
-                gc_collect_cycles();
             }
         }
 
@@ -136,6 +155,7 @@ class Context
      */
     public static function onDestroy(Closure $closure): void
     {
+        self::boot();
         $obj = self::get('context.onDestroy');
 
         if (!$obj) {
@@ -147,12 +167,11 @@ class Context
     }
 
     /**
-     * Initialize the WeakMap and non-fiber context.
+     * Initialize the WeakMap and non-fiber context（兼容入口，现为幂等）.
      */
     public static function init(): void
     {
-        self::$contexts = new WeakMap();
-        self::$nonFiberContext = new ArrayObject([], ArrayObject::ARRAY_AS_PROPS);
+        self::boot();
     }
 
     /**
@@ -162,7 +181,7 @@ class Context
      */
     public static function gc(): void
     {
-        if (!isset(self::$contexts)) {
+        if (self::$contexts === null) {
             return;
         }
         // Copy keys first — modifying a WeakMap during iteration skips entries
@@ -181,5 +200,3 @@ class Context
         gc_collect_cycles();
     }
 }
-
-Context::init();

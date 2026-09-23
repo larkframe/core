@@ -61,7 +61,9 @@ class Base64
         }
 
         if ($key === '') {
-            $key = 'b03aae926e9d664b';
+            // 硬编码默认密钥随源码公开，所有部署共享，防篡改承诺对读过源码的人完全失效；
+            // 必须强制调用方显式传密钥
+            throw new \InvalidArgumentException('authcode() requires an explicit $key (e.g. from config). Refusing to use a public default key.');
         }
 
         $saltLength = 16;
@@ -70,11 +72,9 @@ class Base64
         $keyb = md5(substr($key, 16, 16));
 
         if ($operation === 'ENCODE') {
-            try {
-                $salt = random_bytes($saltLength);
-            } catch (\Exception) {
-                $salt = Rand::str($saltLength);
-            }
+            // 盐必须 CSPRNG：Rand::str 兜底会静默降低熵（密钥空间 62^16 vs 256^16），
+            // 熵源故障应显式抛 RandomException 而非降级
+            $salt = random_bytes($saltLength);
 
             $expiryTime = $expiry ? time() + $expiry : 0;
             $data = pack('N', $expiryTime) . substr(md5($string . $keyb), 0, 16) . $string;

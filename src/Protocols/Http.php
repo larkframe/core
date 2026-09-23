@@ -195,19 +195,24 @@ class Http
         $connection->context ??= new \stdClass();
         $connection->context->chunked = true;
 
-        $pos = $headerLength;
+        // 增量续扫游标：chunked 请求未收完时，每批新数据到达都会重新调用 input()，
+        // 若每次从头扫描已收到的全部 chunk，10MB 上传（约 120 次读取）累计扫描量达数百 MB（O(n²)）。
+        // 游标始终指向「下一个 chunk-size 行的起始位置」，其之前的字节均已校验完毕，可安全续扫。
+        $pos = $connection->context->chunkedScanPos ?? $headerLength;
         $bufLen = strlen($buffer);
         $maxSize = $connection->maxPackageSize;
 
         while (true) {
-            $lineEnd = strpos($buffer, "\r\n", $pos);
+            $lineStart = $pos;
+            $lineEnd = strpos($buffer, "\r\n", $lineStart);
             if ($lineEnd === false) {
+                $connection->context->chunkedScanPos = $lineStart;
                 return 0;
             }
 
-            $semiPos = strpos($buffer, ';', $pos);
+            $semiPos = strpos($buffer, ';', $lineStart);
             $hexEnd = ($semiPos !== false && $semiPos < $lineEnd) ? $semiPos : $lineEnd;
-            $hexStr = substr($buffer, $pos, $hexEnd - $pos);
+            $hexStr = substr($buffer, $lineStart, $hexEnd - $lineStart);
 
             if ($hexStr === '' || !ctype_xdigit($hexStr) || isset($hexStr[16])) {
                 $connection->end(static::HTTP_400, true);
@@ -220,39 +225,46 @@ class Http
                 return 0;
             }
 
-            $pos = $lineEnd + 2;
+            $dataStart = $lineEnd + 2;
 
             if ($chunkSize === 0) {
+                // 结束块：解析 trailer 段直到空行。trailer 体量极小且只出现在请求末尾，
+                // 不纳入增量游标（游标停在结束块行首，最多重复扫描一次）。
+                $trailerPos = $dataStart;
                 while (true) {
-                    $lineEnd = strpos($buffer, "\r\n", $pos);
-                    if ($lineEnd === false) {
+                    $trailerLineEnd = strpos($buffer, "\r\n", $trailerPos);
+                    if ($trailerLineEnd === false) {
+                        $connection->context->chunkedScanPos = $lineStart;
                         return 0;
                     }
-                    if ($lineEnd === $pos) {
-                        $totalLength = $pos + 2;
+                    if ($trailerLineEnd === $trailerPos) {
+                        $totalLength = $trailerPos + 2;
                         if ($totalLength > $maxSize) {
                             $connection->end(static::HTTP_413, true);
                             return 0;
                         }
                         return $totalLength;
                     }
-                    $pos = $lineEnd + 2;
+                    $trailerPos = $trailerLineEnd + 2;
                 }
             }
 
-            if ($pos + $chunkSize + 2 > $bufLen) {
+            if ($dataStart + $chunkSize + 2 > $bufLen) {
+                // chunk 数据未收完：游标停留在本 chunk-size 行首，下次从此处续扫
+                $connection->context->chunkedScanPos = $lineStart;
                 return 0;
             }
-            if (substr($buffer, $pos + $chunkSize, 2) !== "\r\n") {
+            if (substr($buffer, $dataStart + $chunkSize, 2) !== "\r\n") {
                 $connection->end(static::HTTP_400, true);
                 return 0;
             }
-            $pos += $chunkSize + 2;
 
+            $pos = $dataStart + $chunkSize + 2;
             if ($pos > $maxSize) {
                 $connection->end(static::HTTP_413, true);
                 return 0;
             }
+            $connection->context->chunkedScanPos = $pos;
         }
     }
 
@@ -263,7 +275,8 @@ class Http
     {
         $trailers = [];
         if (isset($connection->context->chunked)) {
-            unset($connection->context->chunked);
+            // 同时清除增量续扫游标：keep-alive 连接上的下一个 chunked 请求必须从头部重新开始扫描
+            unset($connection->context->chunked, $connection->context->chunkedScanPos);
             [$buffer, $trailers] = static::decodeChunked($buffer, strpos($buffer, "\r\n\r\n"));
         }
 
@@ -402,7 +415,9 @@ class Http
             'Accept-Ranges' => 'bytes',
         ]);
 
-        if ($offset || $length) {
+        // 206 仅用于真正的部分内容：完整文件（offset=0 且 length=fileSize）必须返回 200，
+        // 否则任何静态文件响应都被标记为无 Content-Range 的非法 206
+        if ($offset > 0 || ($length > 0 && $length < $fileSize)) {
             $offsetEnd = $offset + $bodyLen - 1;
             $response->header('Content-Range', "bytes $offset-$offsetEnd/$fileSize");
             $response->withStatus(206);

@@ -3,7 +3,6 @@
 namespace LarkFrame\Database;
 
 use Illuminate\Container\Container as IlluminateContainer;
-use LarkFrame\Container;
 use LarkFrame\Database\Manager as Capsule;
 use Illuminate\Events\Dispatcher;
 use Illuminate\Pagination\Paginator;

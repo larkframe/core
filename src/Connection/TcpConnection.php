@@ -519,6 +519,8 @@ class TcpConnection
                     $this->error($e);
                 }
                 $this->recvBuffer = '';
+                // 裸 TCP 连接无 protocol，须同样重置读超时，否则活跃连接会在 readTimeout 后被误杀
+                $this->resetReadTimeout();
             }
         }
     }
@@ -603,19 +605,35 @@ class TcpConnection
             $this->eventLoop?->offWritable($socket);
 
             // Buffer drain callback.
-            $this->onBufferDrain?->__invoke($this);
+            if ($this->onBufferDrain !== null) {
+                try {
+                    ($this->onBufferDrain)($this);
+                } catch (Throwable $e) {
+                    $this->error($e);
+                }
+            }
 
-            if ($this->status === self::STATUS_ENDING) {
+            // STATUS_CLOSING 与 STATUS_ENDING 均为优雅关闭：排空缓冲后须销毁连接；
+            // 否则 CLOSING 连接永久滞留事件循环，缓冲再写也丢失响应
+            if ($this->status === self::STATUS_ENDING || $this->status === self::STATUS_CLOSING) {
                 $this->destroy();
             }
             return;
         }
 
-        if ($len > 0) {
-            $this->bytesWritten += $len;
-            $this->sendBuffer = substr($this->sendBuffer, $len);
+        // 写失败（0/false）：死套接字持续报告可写会导致每轮事件循环空转，
+        // 必须在写事件仍注册时销毁，避免单连接打满一个 CPU 核心
+        if ($len <= 0) {
+            if (!is_resource($socket) || feof($socket)) {
+                $this->destroy();
+                return;
+            }
+            $this->checkBufferWillFull();
+            return;
         }
 
+        $this->bytesWritten += $len;
+        $this->sendBuffer = substr($this->sendBuffer, $len);
         $this->checkBufferWillFull();
     }
 

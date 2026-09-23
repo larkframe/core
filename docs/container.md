@@ -70,5 +70,23 @@ Container::has(ServiceInterface::class);    // 转发到全局容器
 
 | 异常类 | 说明 |
 |--------|------|
-| `ContainerException` | 容器解析失败 |
-| `NotFoundException` | 服务未找到 |
+| `ContainerException` | 容器解析失败（含循环别名、别名链超深、构造参数不可解析） |
+| `NotFoundException` | 服务未找到（类不存在且无绑定） |
+
+## 全局容器
+
+默认全局容器实例配置在 `config/config.php` 的 `container` 键：
+
+```php
+'container' => new LarkFrame\Container(),
+```
+
+`Container::getInstance()` 优先返回该配置实例；未配置时回退内置单例。
+静态代理（`Container::get()` 等 `__callStatic`）与 `App::container()` 均经由它。
+
+## 解析行为要点
+
+- **自动装配**：未绑定的具体类按构造函数类型提示递归解析；可选依赖解析失败时使用默认值，必需依赖失败抛异常
+- **单例判定**：`singleton()` / `instance()` 注册的条目解析后缓存；普通 `bind()` 每次解析新实例
+- **参数覆盖**：`make($class, ['paramName' => $value])` 按构造参数名覆盖，透传无共享状态污染
+- **控制器实例化**：路由中的控制器类名经容器解析，支持构造注入

@@ -2,8 +2,6 @@
 
 namespace LarkFrame\Queue;
 
-use LarkFrame\Queue\Job;
-
 /**
  * 队列接口
  */
@@ -48,4 +46,14 @@ interface QueueInterface
      * 清空队列
      */
     public function clear(string $queue): void;
+
+    /**
+     * 获取失败任务列表
+     */
+    public function getFailedJobs(string $queue): array;
+
+    /**
+     * 重试失败任务（按索引）
+     */
+    public function retryFailed(string $queue, int $index): bool;
 }

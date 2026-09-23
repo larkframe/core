@@ -118,7 +118,10 @@ class Job
 
         // If job is a serialized closure or object
         if (!class_exists($job)) {
-            $instance = unserialize($job, ['allowed_classes' => true]);
+            // 对象任务反序列化默认拒绝任意类实例化（防 RCE），仅允许数组/标量；
+            // 确有需要反序列化对象任务时，通过 queue.allowed_job_classes 显式声明类白名单
+            $allowedClasses = (array) \config('queue.allowed_job_classes', []);
+            $instance = unserialize($job, ['allowed_classes' => $allowedClasses]);
             if ($instance === false && $job !== 'b:0;') {
                 throw new \RuntimeException("Unable to unserialize job");
             }

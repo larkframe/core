@@ -166,10 +166,13 @@ class SyncTask
 
 ### 队列消费
 
-持续消费 Redis 队列中的消息：
+持续消费 Redis 队列中的消息。`fire()` 抛异常时应显式 `fail($e)` 转入失败队列
+（保留异常根因），否则任务会滞留 reserved 直到 `retry_after` 超时：
 
 ```php
 use LarkFrame\Queue;
+use LarkFrame\Worker;
+use Throwable;
 
 class ConsumeTask
 {
@@ -184,7 +187,12 @@ class ConsumeTask
             $job = Queue::pop($queue);
             if ($job) {
                 Worker::log("[ConsumeTask] Processing: " . $job->getName());
-                $job->fire();
+                try {
+                    $job->fire();
+                } catch (Throwable $e) {
+                    $job->fail($e);
+                    Worker::log("[ConsumeTask] Job failed: " . $e->getMessage());
+                }
             }
         });
     }
@@ -211,7 +219,7 @@ class CronTask
     }
 }
 
-// ConsumeTask：消费队列
+// ConsumeTask：消费队列（异常时 fail 转入失败队列）
 class ConsumeTask
 {
     public static function run(array $options, array $args): void
@@ -219,7 +227,11 @@ class ConsumeTask
         Worker::$globalEvent->repeat($options['interval'] ?? 1, function () use ($options) {
             $job = Queue::pop($options['queue'] ?? 'emails');
             if ($job) {
-                $job->fire();
+                try {
+                    $job->fire();
+                } catch (Throwable $e) {
+                    $job->fail($e);
+                }
             }
         });
     }

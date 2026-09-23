@@ -30,8 +30,13 @@ class Img
             return false;
         }
 
-        $imageInfo = getimagesize($sourcePath);
+        // 与 resize 的错误抑制策略一致：非图片文件返回 warning + false，静默判失败
+        $imageInfo = @getimagesize($sourcePath);
         if (!$imageInfo) {
+            return false;
+        }
+
+        if (self::isOversized($imageInfo)) {
             return false;
         }
 
@@ -150,23 +155,26 @@ class Img
 
     /**
      * 生成图片的 Base64 Data URI
+     *
+     * 仅使用 getimagesize/file_get_contents 等核心函数，不依赖 GD 扩展
      */
     public static function toDataUri(string $path): string
     {
-        static::ensureGd();
-        if (!file_exists($path)) {
+        if (!is_file($path)) {
             return '';
         }
 
         $imageInfo = @getimagesize($path);
-        if (!$imageInfo) {
+        if (!$imageInfo || empty($imageInfo['mime'])) {
             return '';
         }
 
-        $mime = $imageInfo['mime'];
-        $data = base64_encode(file_get_contents($path));
+        $content = file_get_contents($path);
+        if ($content === false) {
+            return '';
+        }
 
-        return "data:$mime;base64,$data";
+        return "data:{$imageInfo['mime']};base64," . base64_encode($content);
     }
 
     /**

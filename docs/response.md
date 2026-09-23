@@ -33,14 +33,23 @@ $response->withHeaders([
 ## 文件响应
 
 ```php
-// 发送文件（支持 304 Not Modified）
+// 发送文件（支持 304 Not Modified 与 Range 断点续传）
 return (new Response())->file('/path/to/file.pdf');
 
 // 下载文件
 return (new Response())->download('/path/to/file.pdf', 'report.pdf');
+
+// 显式指定区段（返回 206 Partial Content）
+return (new Response())->withFile('/path/to/file.pdf', 1024, 4096);
 ```
 
-`file()` 方法在 Server 模式下自动处理 304 缓存：如果请求头 `If-Modified-Since` 大于文件修改时间，返回 304 状态码。
+`file()` 方法在 Server 模式下自动处理：
+
+- **304 缓存**：请求头 `If-Modified-Since` 与文件修改时间一致时返回 304
+- **Range 断点续传**：请求头 `Range: bytes=0-499` / `bytes=-500`（后缀）
+  自动返回 206 Partial Content + `Content-Range`（Range 头从当前 Request 读取，
+  FPM 无请求上下文时回退 `$_SERVER['HTTP_RANGE']`）
+- 完整文件响应为 200（不带 `Content-Range`）
 
 ## 辅助函数
 

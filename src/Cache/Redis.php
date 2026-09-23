@@ -216,12 +216,16 @@ class Redis
         if (!static::$instance) {
             $config = config('redis');
             if (!is_array($config)) {
-                throw new \RuntimeException('Redis config is not configured. Please check config/redis.php');
+                throw new \RuntimeException("Redis config is not configured. Please check the 'redis' section in config/config.php");
             }
             $client = $config['client'] ?? self::PHPREDIS_CLIENT;
 
             if (!in_array($client, self::ALLOWED_CLIENTS, true)) {
-                $client = self::PHPREDIS_CLIENT;
+                // 非法配置显式失败而非静默降级：拼写错误（如 predis2）降级 phpredis 后
+                // 行为与配置意图不符，且无任何日志可查，是生产排障黑洞
+                throw new \RuntimeException(
+                    "Invalid redis client '{$client}'. Allowed: " . implode(', ', self::ALLOWED_CLIENTS)
+                );
             }
 
             static::$config = $config;

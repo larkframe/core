@@ -855,10 +855,13 @@ class Worker
             @cli_set_process_title("Lark: worker process  {$this->name}");
         }
 
-        // Install signal handler for worker process.
+        // Install signal handler for worker process via the event loop.
+        // 经 onSignal 注册（而非仅 pcntl_signal）：ext-event 的 run() 只 eventBase->loop()
+        // 不调用 pcntl_signal_dispatch，仅 pcntl_signal 注册的处理器在 Event 实现下永不触发，
+        // 导致 stop/reload 失效并产生孤儿进程；Select 的 onSignal 内部仍走 pcntl_signal+dispatch。
         if (DIRECTORY_SEPARATOR === '/' && function_exists('pcntl_signal')) {
-            pcntl_signal(SIGINT, static::signalHandler(...));
-            pcntl_signal(SIGTERM, static::signalHandler(...));
+            static::$globalEvent->onSignal(SIGINT, static::signalHandler(...));
+            static::$globalEvent->onSignal(SIGTERM, static::signalHandler(...));
         }
 
         // onWorkerStart callback.

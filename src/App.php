@@ -95,9 +95,9 @@ class App
             Context::reset(new ArrayObject([\LarkFrame\Request::class => $request]));
             $request->initRequestIdAndStartTime();
             $path = $request->path();
-            // Collapse consecutive slashes (faster than preg_replace for the common case)
-            while (str_contains($path, '//')) {
-                $path = str_replace('//', '/', $path);
+            // 单次正则压缩连续斜杠，避免 while+str_replace 对超长斜杠串的 O(n·迭代) 内存抖动
+            if (str_contains($path, '//')) {
+                $path = preg_replace('~[/]{2,}~', '/', $path);
             }
             $key = $request->method() . $path;
 
@@ -228,7 +228,7 @@ class App
             str_contains($path, "\\") ||
             str_contains($path, "\0")
         ) {
-            $callback = static::getFallback(400);
+            $callback = Middleware::wrapGlobal(static::getFallback(400));
             $request->setApp('');
             $request->setController('');
             $request->setAction('');
@@ -253,13 +253,20 @@ class App
         };
     }
 
+    /**
+     * 404 兜底：经全局中间件管道，使 CORS 等响应头中间件能作用于未命中请求
+     */
     protected static function notFound(mixed $request): Response
     {
         $errorPage = config('error_page.404', null);
-        if ($errorPage) {
-            return redirect($errorPage);
-        }
-        return new \LarkFrame\Response(404, ['Content-Type' => 'text/html; charset=utf-8'], static::buildErrorPage(404));
+        $fallback = static function () use ($errorPage): Response {
+            if ($errorPage) {
+                return redirect($errorPage);
+            }
+            return new \LarkFrame\Response(404, ['Content-Type' => 'text/html; charset=utf-8'], static::buildErrorPage(404));
+        };
+        $callback = Middleware::wrapGlobal($fallback);
+        return $callback($request);
     }
 
     /**
@@ -304,22 +311,12 @@ HTML;
     {
         $isController = is_array($call) && is_string($call[0]);
         $middlewares = Middleware::getMiddleware($call, $route);
-        $container = self::container();
-
-        foreach ($middlewares as $key => $item) {
-            $middleware = $item[0];
-            if (is_string($middleware)) {
-                $middleware = $container->get($middleware);
-            } elseif ($middleware instanceof Closure) {
-                $middleware = $middleware($container);
-            }
-            $middlewares[$key][0] = $middleware;
-        }
+        $middlewares = Middleware::resolveInstances($middlewares);
 
         $anonymousArgs = array_values($args);
 
         if ($isController) {
-            $call[0] = $container->get($call[0]);
+            $call[0] = static::container()->get($call[0]);
         }
 
         if ($middlewares !== []) {
@@ -405,8 +402,11 @@ HTML;
                 $callback[1] = $action;
             }
 
+            // 缓存可重建元信息（原始回调 + 参数），不缓存 controller 实例及其实例化闭包；
+            // 命中时经 getCallback 重建实例，杜绝同名 URL 复用上一请求 controller 的状态污染
+            static::collectCallbacks($key, [$callback, $args, $controller ?: '', $action, $route]);
+
             $callback = static::getCallback($callback, $args, $route);
-            static::collectCallbacks($key, [$callback, $controller ?: '', $action, $route]);
             $request->setController($controller ?: '');
             $request->setAction($action);
             $request->setRoute($route);
@@ -414,13 +414,16 @@ HTML;
             return true;
         }
 
-        // P2-25：METHOD_NOT_ALLOWED 时直接发送 405 + Allow 头（FastRoute 已自动映射 GET→HEAD，
-        // OPTIONS 命中此处并返回所有注册方法），避免之前 405 被误当 404 发送
+        // P2-25：METHOD_NOT_ALLOWED 时发送 405 + Allow 头（FastRoute 已自动映射 GET→HEAD，
+        // OPTIONS 命中此处并返回所有注册方法）。经全局中间件管道包裹——
+        // CORS 预检（OPTIONS）通常未注册路由，不穿管道则预检中间件分支永远不执行
         if ($routeInfo[0] === Dispatcher::METHOD_NOT_ALLOWED) {
             $allowedMethods = is_array($routeInfo[1] ?? null) ? $routeInfo[1] : [];
             $allowHeader = ['Allow' => implode(', ', $allowedMethods)];
-            $response = new \LarkFrame\Response(405, $allowHeader, '405 Method Not Allowed');
-            static::send($connection, $response, $request);
+            $callback = Middleware::wrapGlobal(
+                static fn(): \LarkFrame\Response => new \LarkFrame\Response(405, $allowHeader, '405 Method Not Allowed')
+            );
+            static::send($connection, $callback($request), $request);
             return true;
         }
 
@@ -448,7 +451,8 @@ HTML;
 
         // Do NOT cache static file callbacks — files may be modified/deleted at runtime.
         // Each request re-checks file existence for correctness.
-        $callback = static::getCallback(function ($request) use ($file) {
+        // wrapGlobal 复用进程级缓存的全局中间件实例链（getCallback 每次重建会重复反射解析）
+        $callback = Middleware::wrapGlobal(function ($request) use ($file) {
             clearstatcache(true, $file);
             if (!is_file($file)) {
                 return new \LarkFrame\Response(404, ['Content-Type' => 'text/html; charset=utf-8'], static::buildErrorPage(404));
@@ -491,9 +495,13 @@ HTML;
 
         $keepAlive = $request->header('connection');
         $isKeepAlive = false;
-        if ($keepAlive === null && $request->protocolVersion() === '1.1') {
+        if ($keepAlive === null) {
+            $isKeepAlive = $request->protocolVersion() === '1.1';
+        } elseif (strcasecmp($keepAlive, 'keep-alive') === 0) {
+            // 快路径：绝大多数连接头就是单一 "keep-alive"/"close" 值，
+            // 免去每请求的 strtolower+explode+array_map+in_array 开销
             $isKeepAlive = true;
-        } elseif ($keepAlive !== null) {
+        } else {
             // Handle comma-separated values like "Keep-Alive, TE"
             $tokens = array_map('trim', explode(',', strtolower($keepAlive)));
             $isKeepAlive = in_array('keep-alive', $tokens, true);
@@ -568,7 +576,8 @@ HTML;
         }
 
         date_default_timezone_set($env['TIME_ZONE'] ?? 'Asia/Shanghai');
-        define('RUN_MODE', strtolower($env['RUN_MODE']) ?? 'prod');
+        // ?? 必须作用于取值之前：strtolower() 永不返回 null，写在后面时键缺失会先触发警告
+        define('RUN_MODE', strtolower($env['RUN_MODE'] ?? 'prod'));
         if (RUN_MODE === 'prod') {
             define('isProd', true);
         } else {
@@ -616,21 +625,57 @@ HTML;
     }
 
     /**
+     * 统一注册错误处理器。
+     *
+     * 所有运行模式（Server/Task/Web/Shell）使用同一套 error 配置：
+     *   - error.catch = true: 使用 config('error.handler') 注册，logger 走 config('error.options.logger')
+     *   - error.catch = false: Server/Task 退化为最基本的 error→exception 转换；
+     *                          Web/Shell 不注册（保持 PHP 默认行为）
+     *
+     * @param bool $throwOnError Server/Task 为 true：错误转 ErrorException 抛出，由 onMessage
+     *                           try-catch 或 set_exception_handler 统一记录日志；
+     *                           Web/Shell 为 false：记录日志并抑制错误。
+     * @param bool $skipForStaticFiles Web/Shell 模式下跳过静态资源请求（ROUTE_VALUE 含 '.'）。
+     */
+    protected static function registerErrorHandler(bool $throwOnError = false, bool $skipForStaticFiles = false): void
+    {
+        if (!config('error.catch', false)) {
+            if ($throwOnError) {
+                set_error_handler(static function (int $level, string $message, string $file = '', int $line = 0): bool {
+                    if (error_reporting() & $level) {
+                        throw new \ErrorException($message, 0, $level, $file, $line);
+                    }
+                    return false;
+                });
+            }
+            return;
+        }
+        if ($skipForStaticFiles && defined('ROUTE_VALUE') && str_contains(ROUTE_VALUE, '.')) {
+            return;
+        }
+        $errorHandler = config('error.handler', \LarkFrame\ErrorHandler::class);
+        if ($errorHandler && method_exists($errorHandler, 'register')) {
+            $options = config('error.options', []);
+            call_user_func([$errorHandler, 'register'], $options, $throwOnError);
+        }
+    }
+
+    /**
      * Run as server (Worker-based).
      */
     protected static function runAsServer(): void
     {
         $config = config('server');
-        Worker::$pidFile = ROOT_PATH . DIRECTORY_SEPARATOR . 'runtime' . DIRECTORY_SEPARATOR . ($config['pidFile'] ?? 'server.pid');
-        Worker::$stdoutFile = ROOT_PATH . DIRECTORY_SEPARATOR . 'runtime' . DIRECTORY_SEPARATOR . ($config['stdoutFile'] ?? 'server.stdout.log');
-        Worker::$logFile = ROOT_PATH . DIRECTORY_SEPARATOR . 'runtime' . DIRECTORY_SEPARATOR . ($config['logFile'] ?? 'server.log');
+        // 统一经 runtime_path() 解析，使 app.runtime_path 配置对运行时文件生效
+        Worker::$pidFile = runtime_path($config['pidFile'] ?? 'server.pid');
+        Worker::$stdoutFile = runtime_path($config['stdoutFile'] ?? 'server.stdout.log');
+        Worker::$logFile = runtime_path($config['logFile'] ?? 'server.log');
         Worker::$eventLoopClass = $config['eventLoopClass'] ?? '';
         Worker::$daemonize = $config['daemonize'] ?? false;
         TcpConnection::$defaultMaxPackageSize = 10 * 1024 * 1024;
 
         $listen = $config['socketName'] ?? '127.0.0.1:8080';
         $worker = new Worker($listen, []);
-        $config = config('server');
         $worker->name = config('app.name', 'server');
         $worker->count = $config['worker']['count'] ?? 1;
         $worker->reusePort = $config['worker']['reusePort'] ?? true;
@@ -643,12 +688,6 @@ HTML;
                 Worker::$eventLoopClass = Select::class;
             }
 
-            set_error_handler(function ($level, $message, $file = '', $line = 0) {
-                if (error_reporting() & $level) {
-                    throw new \ErrorException($message, 0, $level, $file, $line);
-                }
-            });
-
             if ($worker) {
                 // 用 microtime(true) 获取浮点秒，否则 time() 整数秒差值恒为整数，<= 0.1 等价于 <= 0
                 register_shutdown_function(function (float $startTime) {
@@ -660,6 +699,9 @@ HTML;
 
             Config::clear();
             Config::load();
+            // 统一错误处理器：error 配置生效后注册，throwOnError=true 将错误转为 ErrorException
+            // 由 onMessage 的 try-catch 记录到日志（含完整请求上下文）
+            static::registerErrorHandler(true);
             \LarkFrame\Route::load();
             Middleware::load(config('server.middleware', []));
 
@@ -677,96 +719,111 @@ HTML;
     protected static function runAsNormal(): mixed
     {
         $consts = \LarkFrame\Consts::class;
-        if (in_array(RUN_TYPE, [$consts::RUN_TYPE_SHELL, $consts::RUN_TYPE_WEB])) {
-            if (RUN_TYPE == $consts::RUN_TYPE_WEB) {
-                $method = strtoupper($_SERVER['REQUEST_METHOD']);
-                // 用 parse_url 提取 path，避免 str_replace 替换 URI 中所有匹配位置导致路径破坏
-                $route = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?? '/';
-                if (str_ends_with($route, "/") || str_ends_with($route, "?")) {
-                    $route = substr($route, 0, strlen($route) - 1);
-                }
-                if (!$route) {
-                    $route = '/';
-                }
-                if (str_starts_with($route, "/.")) {
-                    return '403 Forbidden';
-                }
-            } else {
-                $method = "SHELL";
-                $route = $_SERVER['argv'][1] ?? '';
-                if (!$route) {
-                    $route = '/';
-                }
-                // Auto-prepend '/' for route matching if not present
-                if (!str_starts_with($route, '/')) {
-                    $route = '/' . $route;
-                }
+        if (!in_array(RUN_TYPE, [$consts::RUN_TYPE_SHELL, $consts::RUN_TYPE_WEB])) {
+            return "Error Run Type";
+        }
+
+        if (RUN_TYPE == $consts::RUN_TYPE_WEB) {
+            $method = strtoupper($_SERVER['REQUEST_METHOD']);
+            // 用 parse_url 提取 path，避免 str_replace 替换 URI 中所有匹配位置导致路径破坏
+            $route = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?? '/';
+            if (str_ends_with($route, "/") || str_ends_with($route, "?")) {
+                $route = substr($route, 0, strlen($route) - 1);
             }
-
-            $route = preg_replace("~[\/]{2,}~", "/", $route);
-            define('ROUTE_VALUE', $route);
-
-            if (config('error.catch', false)) {
-                $errorHandler = config("error.handler", null);
-                if ($errorHandler !== null && !str_contains(ROUTE_VALUE, '.')) {
-                    if (method_exists($errorHandler, "register")) {
-                        $errorHandlerOption = config("error.options", []);
-                        call_user_func([$errorHandler, 'register'], $errorHandlerOption);
-                    }
-                }
+            if (!$route) {
+                $route = '/';
             }
+            if (str_starts_with($route, "/.")) {
+                return '403 Forbidden';
+            }
+        } else {
+            $method = "SHELL";
+            $route = $_SERVER['argv'][1] ?? '';
+            if (!$route) {
+                $route = '/';
+            }
+            // Auto-prepend '/' for route matching if not present
+            if (!str_starts_with($route, '/')) {
+                $route = '/' . $route;
+            }
+        }
 
-            \LarkFrame\Route::load();
-            $request = new Request();
-            Context::set(Request::class, $request);
+        $route = preg_replace("~[\/]{2,}~", "/", $route);
+        define('ROUTE_VALUE', $route);
 
+        static::registerErrorHandler(false, true);
+
+        \LarkFrame\Route::load();
+        // 全局中间件在 dispatch 前加载：404/405 兜底管道同样需要
+        //（CORS 预检等未命中路由的请求不走 FOUND 分支）
+        Middleware::load(config('server.middleware', []));
+        $request = new Request();
+        Context::set(Request::class, $request);
+
+        try {
             $routeInfo = \LarkFrame\Route::dispatch($method, $route);
 
             if ($routeInfo[0] === Dispatcher::FOUND) {
                 $routeInfo[0] = 'route';
                 $callback = $routeInfo[1]['callback'];
-                $args = !empty($routeInfo[2]) ? $routeInfo[2] : [];
-                $anonymousArgs = [];
-                if ($args) {
-                    $anonymousArgs = array_values($args);
-                }
+                $routeObj = $routeInfo[1]['route'] ?? null;
+                $args = $routeInfo[2] ?? [];
+
                 $controller = $callback[0];
-                $action = $callback[1] ?? '';
-                $action = $action ?? "index";
-                if (!str_contains($action, 'Action')) {
-                    $action .= 'Action';
+                $action = $callback[1] ?? 'index';
+                $actionSuffix = \LarkFrame\Route::getActionSuffix();
+                if ($actionSuffix && !str_contains($action, $actionSuffix)) {
+                    $action .= $actionSuffix;
                 }
                 $callback[1] = $action;
 
-                $container = static::container();
-                $call = [$controller, $action];
-                $call[0] = $container->get($call[0]);
-                if (!empty($anonymousArgs)) {
-                    $result = $call($request, ...$anonymousArgs);
-                } else {
-                    $result = $call($request);
+                // 与 Server 模式 findRoute 对齐：路由参数注入 RouteDefinition，
+                // 默认参数 + URL 参数合并后按命名参数传给 action
+                if ($routeObj && $args) {
+                    $routeObj->setParams($args);
                 }
+                $callArgs = $routeObj ? array_merge($routeObj->param(), $args) : $args;
+
+                // 与 Server 模式对齐：洋葱管道 + 响应归一 + 异常转 500
+                // （全局中间件已在 dispatch 前统一 load）
+                $callback = static::getCallback($callback, $callArgs, $routeObj);
+
+                $request->setController($controller ?: '');
+                $request->setAction($action);
+                $request->setRoute($routeObj);
+
+                $result = $callback($request);
 
                 \LarkFrame\Log::info("");
                 return $result;
-            } else {
-                if (!str_ends_with($route, '.php') && $route != $_SERVER['DOCUMENT_URI']) {
-                    $filePath = realpath(ROOT_PATH . DIRECTORY_SEPARATOR . 'public' . DIRECTORY_SEPARATOR . $route);
-                    if ($filePath && file_exists($filePath) && is_file($filePath)) {
-                        $result = (new Response())->file($filePath);
-                        \LarkFrame\Log::info("");
-                        return $result;
-                    }
+            }
+
+            // CLI（Shell 模式）无 DOCUMENT_URI，用 ?? 兜底避免 undefined key warning
+            if (!str_ends_with($route, '.php') && $route != ($_SERVER['DOCUMENT_URI'] ?? null)) {
+                $filePath = realpath(ROOT_PATH . DIRECTORY_SEPARATOR . 'public' . DIRECTORY_SEPARATOR . $route);
+                if ($filePath && file_exists($filePath) && is_file($filePath)) {
+                    $result = (new Response())->file($filePath);
+                    \LarkFrame\Log::info("");
+                    return $result;
                 }
             }
             $errorPage = config('error_page.404', null);
-            if ($errorPage) {
-                return redirect($errorPage);
-            } else {
-                return "404 Not Found";
+            // Shell 模式保持纯文本输出；Web 模式必须返回 Response(404)，
+            // 字符串会被 run() 直接 echo 成 200 状态码
+            if (RUN_TYPE === $consts::RUN_TYPE_SHELL) {
+                return $errorPage ? redirect($errorPage) : "404 Not Found";
             }
-        } else {
-            return "Error Run Type";
+            $fallback = static function () use ($errorPage): Response {
+                if ($errorPage) {
+                    return redirect($errorPage);
+                }
+                return new Response(404, ['Content-Type' => 'text/html; charset=utf-8'], static::buildErrorPage(404));
+            };
+            return Middleware::wrapGlobal($fallback)($request);
+        } finally {
+            // 请求级 Context（Request、连接归还回调等）在响应产出后清理，
+            // 对齐 Server 模式 send() 的 Context::destroy()
+            Context::destroy();
         }
     }
 
@@ -806,9 +863,9 @@ HTML;
         $workerCount = $taskConfig['worker']['count'] ?? 1;
         $daemonize = $taskConfig['daemonize'] ?? false;
 
-        Worker::$pidFile = ROOT_PATH . DIRECTORY_SEPARATOR . 'runtime' . DIRECTORY_SEPARATOR . ($taskConfig['pidFile'] ?? "task-$taskName.pid");
-        Worker::$stdoutFile = ROOT_PATH . DIRECTORY_SEPARATOR . 'runtime' . DIRECTORY_SEPARATOR . ($taskConfig['stdoutFile'] ?? "task-$taskName.stdout.log");
-        Worker::$logFile = ROOT_PATH . DIRECTORY_SEPARATOR . 'runtime' . DIRECTORY_SEPARATOR . ($taskConfig['logFile'] ?? "task-$taskName.log");
+        Worker::$pidFile = runtime_path($taskConfig['pidFile'] ?? "task-$taskName.pid");
+        Worker::$stdoutFile = runtime_path($taskConfig['stdoutFile'] ?? "task-$taskName.stdout.log");
+        Worker::$logFile = runtime_path($taskConfig['logFile'] ?? "task-$taskName.log");
         Worker::$daemonize = $daemonize;
 
         $worker = new Worker();
@@ -820,14 +877,9 @@ HTML;
                 Worker::$eventLoopClass = Select::class;
             }
 
-            set_error_handler(function ($level, $message, $file = '', $line = 0) {
-                if (error_reporting() & $level) {
-                    throw new \ErrorException($message, 0, $level, $file, $line);
-                }
-            });
-
             Config::clear();
             Config::load();
+            static::registerErrorHandler(true);
 
             call_user_func([$handler, 'run'], $options, $taskArgsParsed);
         };
@@ -836,7 +888,6 @@ HTML;
         // User command:    php task.php <taskname> [action] [args]
         // Worker expects:  php task.php <action> [args]
         // So we remove taskname from argv[1] and put action there instead
-        $action = $_SERVER['argv'][2] ?? 'start';
         $newArgv = [$_SERVER['argv'][0], $action];
         for ($i = 3; $i < count($_SERVER['argv']); $i++) {
             $newArgv[] = $_SERVER['argv'][$i];

@@ -40,7 +40,9 @@ class ViewVarHolder
     public static function getVars(): array
     {
         if (static::isServerMode()) {
-            return \LarkFrame\Context::get('_view_vars', []);
+            // 请求上下文未写入时回退 static：worker 启动阶段（Fiber 外）assign 的变量
+            // 才能被请求 Fiber 内的 render 读到，消除读写存储错位
+            return \LarkFrame\Context::get('_view_vars', self::$vars);
         }
 
         return self::$vars;
@@ -63,6 +65,8 @@ class ViewVarHolder
     {
         if (static::isServerMode()) {
             \LarkFrame\Context::set('_view_vars', $vars);
+            // 双写 static：Fiber 外 assign、Fiber 内 render 的场景下两侧存储保持一致
+            self::$vars = $vars;
             return;
         }
 

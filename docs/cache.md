@@ -37,6 +37,10 @@ $fileCache = Cache::store('file');
 $apcuCache = Cache::store('apcu');
 ```
 
+> Redis store 的键空间隔离：同一 Redis 连接被多个 store 复用时，各 store
+> 默认以 store 名作为键前缀（namespace），互不污染——`clear()` 一个 store
+> 不会清掉另一个。可用 store 配置的 `namespace` 键自定义前缀。
+
 ## 配置
 
 ```php
@@ -50,7 +54,9 @@ $apcuCache = Cache::store('apcu');
         ],
         'file' => [
             'driver' => 'file',
-            'path' => runtime_path('cache'),
+            // 闭包延迟求值（同 Log 配置约定）：实例化时才解析 runtime_path，
+            // 使 app.runtime_path 配置对缓存目录生效
+            'path' => fn() => runtime_path('cache'),
         ],
         'array' => [
             'driver' => 'array',
@@ -62,6 +68,10 @@ $apcuCache = Cache::store('apcu');
     ],
 ]
 ```
+
+> **注意（array 驱动并发）**：默认 `serialize => false` 直接存对象引用，
+> Server 模式下同进程多请求共享实例，一方修改缓存对象会影响另一方读取。
+> 需要强隔离时配置 `'serialize' => true`。
 
 ## 支持的驱动
 

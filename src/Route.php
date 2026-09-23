@@ -278,13 +278,16 @@ class Route
             }
         } else {
             $callback = array_values($callback);
-            if ($actionSuffix && str_contains($callback[1], $actionSuffix)) {
-                $callback[1] = str_replace($actionSuffix, '', $callback[1]);
+            // isset 前置：单元素 [Controller::class] 缺方法名时避免 undefined key warning
+            $action = $callback[1] ?? '';
+            if ($actionSuffix && str_contains($action, $actionSuffix)) {
+                $action = str_replace($actionSuffix, '', $action);
             }
-            $methodWithSuffix = $callback[1] . $actionSuffix;
+            $methodWithSuffix = $action . $actionSuffix;
             if (!isset($callback[1]) || !class_exists($callback[0]) || !method_exists($callback[0], $methodWithSuffix)) {
                 throw new \RuntimeException("Route $path " . json_encode($callback) . " is not callable (method {$callback[0]}::{$methodWithSuffix} does not exist)");
             }
+            $callback[1] = $action;
         }
 
         return $callback;

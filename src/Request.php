@@ -9,7 +9,6 @@ use LarkFrame\Request\RequestSourceInterface;
 use LarkFrame\Request\ServerSource;
 use LarkFrame\Request\WebSource;
 use LarkFrame\Request\ShellSource;
-use LarkFrame\Util\Rand;
 use RuntimeException;
 use Stringable;
 use LarkFrame\Connection\TcpConnection;
@@ -120,7 +119,12 @@ class Request implements Stringable
     /**
      * Whether the source has been initialized.
      */
-    protected bool $sourceInitialized = false;
+    protected bool $sourceInitialized = true;
+
+    /**
+     * Cached isServerMode() result (stable per request).
+     */
+    protected ?bool $serverMode = null;
 
     /**
      * Constructor.
@@ -151,17 +155,20 @@ class Request implements Stringable
 
     /**
      * Check if running in server mode (has raw HTTP buffer).
+     * 结果按请求不变，缓存避免每次 get/post/header 都走一次接口方法调用。
      */
     protected function isServerMode(): bool
     {
-        return $this->source->hasRawBuffer();
+        return $this->serverMode ??= $this->source->hasRawBuffer();
     }
 
     public function initRequestIdAndStartTime(): void
     {
         if ($this->isServerMode()) {
-            $this->data['requestId'] = strtolower(substr(md5(microtime() . uniqid(gethostname() . '_', true)), 8, 16) . Rand::str(16));
-            $this->data['startTime'] = microtime(true);
+            // ServerSource 已在构造时生成 requestId/startTime，此处 ??= 保证幂等，
+            // 避免重复 random_bytes/microtime 的双写（单次 CSPRNG 调用）
+            $this->data['requestId'] ??= bin2hex(random_bytes(16));
+            $this->data['startTime'] ??= microtime(true);
         }
     }
 
@@ -785,10 +792,18 @@ class Request implements Stringable
 
     /**
      * Get input value from GET or POST.
+     *
+     * GET 优先且命中时不再触发 POST body 解析：原实现急切求值 post()
+     * （PHP 实参先求值），POST/JSON 请求读取 query 参数也会解析整个 body。
+     * query string 不含 null 值（parse_str 产出字符串），null 即"未命中"。
      */
     public function input(string $name, mixed $default = null): mixed
     {
-        return $this->get($name, $this->post($name, $default));
+        $value = $this->get($name, null);
+        if ($value !== null) {
+            return $value;
+        }
+        return $this->post($name, $default);
     }
 
     /**

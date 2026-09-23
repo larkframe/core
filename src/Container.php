@@ -209,32 +209,42 @@ class Container implements ContainerInterface
      */
     protected function autowire(string $class, array $overrides = []): object
     {
-        $reflector = $this->reflectionCache[$class] ?? null;
-        if ($reflector === null) {
-            try {
-                $reflector = new ReflectionClass($class);
-            } catch (\ReflectionException $e) {
-                throw new ContainerException("Unable to reflect class '$class': " . $e->getMessage(), 0, $e);
-            }
-            $this->reflectionCache[$class] = $reflector;
+        // 构造器注入的循环依赖检测：进入解析时标记，结束/异常时清除
+        if (isset($this->resolving[$class])) {
+            throw new ContainerException("Circular dependency detected while resolving '$class'");
         }
-
-        if (!$reflector->isInstantiable()) {
-            throw new ContainerException("Class '$class' is not instantiable (it may be an interface or abstract class). Use bind() to provide a concrete implementation.");
-        }
-
-        $constructor = $reflector->getConstructor();
-
-        if ($constructor === null) {
-            return new $class();
-        }
-
-        $parameters = $this->resolveParameters($constructor->getParameters(), $class, $overrides);
+        $this->resolving[$class] = true;
 
         try {
-            return $reflector->newInstanceArgs($parameters);
-        } catch (\ReflectionException $e) {
-            throw new ContainerException("Unable to instantiate '$class': " . $e->getMessage(), 0, $e);
+            $reflector = $this->reflectionCache[$class] ?? null;
+            if ($reflector === null) {
+                try {
+                    $reflector = new ReflectionClass($class);
+                } catch (\ReflectionException $e) {
+                    throw new ContainerException("Unable to reflect class '$class': " . $e->getMessage(), 0, $e);
+                }
+                $this->reflectionCache[$class] = $reflector;
+            }
+
+            if (!$reflector->isInstantiable()) {
+                throw new ContainerException("Class '$class' is not instantiable (it may be an interface or abstract class). Use bind() to provide a concrete implementation.");
+            }
+
+            $constructor = $reflector->getConstructor();
+
+            if ($constructor === null) {
+                return new $class();
+            }
+
+            $parameters = $this->resolveParameters($constructor->getParameters(), $class, $overrides);
+
+            try {
+                return $reflector->newInstanceArgs($parameters);
+            } catch (\ReflectionException $e) {
+                throw new ContainerException("Unable to instantiate '$class': " . $e->getMessage(), 0, $e);
+            }
+        } finally {
+            unset($this->resolving[$class]);
         }
     }
 

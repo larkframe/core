@@ -57,11 +57,16 @@ class Str
     public static function mask(string $str, int $keepStart = 3, int $keepEnd = 4, string $maskChar = '*'): string
     {
         $len = mb_strlen($str);
-        if ($len <= $keepStart + $keepEnd) {
+        if ($len === 0) {
             return $str;
         }
+        // 短串保留两端会泄漏原文：仅保留首字符，其余全部脱敏
+        if ($len <= $keepStart + $keepEnd) {
+            return mb_substr($str, 0, 1) . str_repeat($maskChar, $len - 1);
+        }
         $start = mb_substr($str, 0, $keepStart);
-        $end = mb_substr($str, -$keepEnd);
+        // keepEnd=0 时 -$keepEnd 即 -0，mb_substr 从 0 取整串导致原文完整泄漏
+        $end = $keepEnd > 0 ? mb_substr($str, -$keepEnd) : '';
         $maskLen = $len - $keepStart - $keepEnd;
         return $start . str_repeat($maskChar, $maskLen) . $end;
     }
@@ -113,6 +118,7 @@ class Str
      *
      * P2-45 方案 A：明确 SI（1000 基，KB/MB）与 IEC（1024 基，KiB/MiB）两种标准，
      * 默认 IEC（1024 基）符合多数运维场景；调用方可传 $iec=false 切换 SI。
+     * 用循环除法代替 log()：log(1024, 1024) 的浮点误差可能把边界值 floor 到低一档单位。
      */
     public static function formatBytes(int $bytes, bool $iec = true, int $precision = 2): string
     {
@@ -123,8 +129,13 @@ class Str
         $units = $iec
             ? ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
             : ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-        $exp = (int)floor(log($bytes, $base));
-        $exp = min($exp, count($units) - 1);
-        return round($bytes / pow($base, $exp), $precision) . ' ' . $units[$exp];
+        $value = (float)$bytes;
+        $exp = 0;
+        $lastIndex = count($units) - 1;
+        while ($value >= $base && $exp < $lastIndex) {
+            $value /= $base;
+            $exp++;
+        }
+        return round($value, $precision) . ' ' . $units[$exp];
     }
 }

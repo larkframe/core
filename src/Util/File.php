@@ -6,21 +6,28 @@ class File
 {
     /**
      * 递归复制目录
+     *
+     * @throws \RuntimeException 目录创建或文件复制失败时抛出（含路径与原因），而非静默跳过
      */
     public static function copyDir(string $source, string $dest, bool $overwrite = false): void
     {
         if (is_dir($source)) {
-            if (!is_dir($dest)) {
-                mkdir($dest, 0755, true);
+            if (!is_dir($dest) && !mkdir($dest, 0755, true) && !is_dir($dest)) {
+                throw new \RuntimeException("copyDir: unable to create directory {$dest}");
             }
             $files = scandir($source);
+            if ($files === false) {
+                throw new \RuntimeException("copyDir: unable to scan directory {$source}");
+            }
             foreach ($files as $file) {
                 if ($file !== '.' && $file !== '..') {
                     static::copyDir("$source/$file", "$dest/$file", $overwrite);
                 }
             }
         } elseif (file_exists($source) && ($overwrite || !file_exists($dest))) {
-            copy($source, $dest);
+            if (!copy($source, $dest)) {
+                throw new \RuntimeException("copyDir: unable to copy {$source} to {$dest}");
+            }
         }
     }
 
@@ -56,7 +63,11 @@ class File
         if (!is_dir($basePath)) {
             return [];
         }
-        $paths = array_diff(scandir($basePath), ['.', '..']) ?: [];
+        $entries = scandir($basePath);
+        if ($entries === false) {
+            return [];
+        }
+        $paths = array_diff($entries, ['.', '..']);
         return $withBasePath ? array_map(static fn($path) => $basePath . DIRECTORY_SEPARATOR . $path, $paths) : $paths;
     }
 
@@ -94,7 +105,12 @@ class File
         $dir = dirname($path);
         static::ensureDir($dir);
 
-        $tmpFile = $path . '.' . uniqid() . '.tmp';
+        // tempnam 随机命名且进程内保证唯一：uniqid 基于微秒时钟，同微秒并发写入会互相覆盖
+        $tmpFile = tempnam($dir, basename($path) . '.');
+        if ($tmpFile === false) {
+            return false;
+        }
+
         $result = file_put_contents($tmpFile, $content);
         if ($result === false) {
             @unlink($tmpFile);
@@ -147,6 +163,9 @@ class File
 
     /**
      * 递归扫描目录获取所有文件
+     *
+     * @param bool $withBasePath true 返回绝对路径；false 返回相对于 $dir 的子路径
+     *                           （getFilename 会丢失子目录前缀，/a/f.txt 与 /b/f.txt 无法区分）
      */
     public static function scanDirRecursive(string $dir, bool $withBasePath = true): array
     {
@@ -154,9 +173,10 @@ class File
             return [];
         }
         $result = [];
+        $base = rtrim($dir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
         $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS));
         foreach ($iterator as $file) {
-            $result[] = $withBasePath ? $file->getPathname() : $file->getFilename();
+            $result[] = $withBasePath ? $file->getPathname() : substr($file->getPathname(), strlen($base));
         }
         return $result;
     }

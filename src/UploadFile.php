@@ -86,14 +86,19 @@ class UploadFile extends File
                     throw new FileException(sprintf('Could not move the uploaded file "%s" to "%s" (%s)', $this->getPathname(), $destination, strip_tags($error)));
                 }
             } else {
-                // Server/Shell 模式：无 $_FILES 机制，直接 rename
+                // Server/Shell 模式：无 $_FILES 机制，直接 rename；
+                // 跨设备 rename 失败（如 /tmp 独立分区 → 数据盘）回退 copy + unlink，与父类 File::move 行为一致
                 if (!rename($this->getPathname(), $destination)) {
-                    throw new FileException(sprintf('Could not move the file "%s" to "%s" (%s)', $this->getPathname(), $destination, strip_tags($error)));
+                    if (!@copy($this->getPathname(), $destination)) {
+                        throw new FileException(sprintf('Could not move the file "%s" to "%s" (%s)', $this->getPathname(), $destination, strip_tags($error)));
+                    }
+                    @unlink($this->getPathname());
                 }
             }
 
             @chmod($destination, 0666 & ~umask());
-            return new self($destination);
+            // 保留上传元数据（原名/MIME/错误码），否则链式调用 getUploadName()/isValid() 全部失效
+            return new self($destination, $this->uploadName, $this->uploadMimeType, $this->uploadErrorCode);
         } finally {
             restore_error_handler();
         }

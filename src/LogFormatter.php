@@ -17,8 +17,8 @@ class LogFormatter extends NormalizerFormatter
     protected $ignoreEmptyContextAndExtra;
     /** @var bool */
     protected $includeStacktraces;
-    /** @var ?callable */
-    protected $stacktracesParser;
+    /** @var ?callable 自定义堆栈行过滤器（接收单行 trace 字符串，返回过滤结果） */
+    protected $stacktraceParser;
     /** @var bool */
     protected bool $stripAnsi = true;
 
@@ -42,7 +42,7 @@ class LogFormatter extends NormalizerFormatter
         $this->includeStacktraces = $include;
         if ($this->includeStacktraces) {
             $this->allowInlineLineBreaks = true;
-            $this->stacktracesParser = $parser;
+            $this->stacktraceParser = $parser;
         }
 
         return $this;
@@ -81,27 +81,7 @@ class LogFormatter extends NormalizerFormatter
         $vars = parent::format($record);
         $output = $this->format;
         $requestObj = request();
-        if (is_null($requestObj)) {
-            $request = [
-                'all' => "",
-                'requestId' => '',
-                'uri' => '',
-                'remoteIp' => '',
-                'localIp' => '',
-                'usedTime' => '',
-                'userAgent' => '',
-            ];
-        } else {
-            $request = [
-                'all' => $requestObj->all(),
-                'requestId' => $requestObj->requestId(),
-                'uri' => $requestObj->uri(),
-                'remoteIp' => $requestObj->getRemoteIp(),
-                'localIp' => $requestObj->getLocalIp(),
-                'usedTime' => $requestObj->usedTime(),
-                'userAgent' => $requestObj->header('user-agent'),
-            ];
-        }
+
         foreach ($vars['extra'] as $var => $val) {
             if (false !== strpos($output, '%extra.' . $var . '%')) {
                 $output = str_replace('%extra.' . $var . '%', $this->stringify($val), $output);
@@ -116,19 +96,23 @@ class LogFormatter extends NormalizerFormatter
             }
         }
 
+        // 语义与 Monolog LineFormatter 对齐：仅在为空时移除占位符，非空数据照常渲染
         if ($this->ignoreEmptyContextAndExtra) {
-            if (!empty($vars['context'])) unset($vars['context']);
-            $output = str_replace('%context%', '', $output);
-
-            if (!empty($vars['extra'])) unset($vars['extra']);
-            $output = str_replace('%extra%', '', $output);
+            if (empty($vars['context'])) {
+                $output = str_replace('%context%', '', $output);
+            }
+            if (empty($vars['extra'])) {
+                $output = str_replace('%extra%', '', $output);
+            }
         }
 
         unset($vars['channel']);
         foreach ($vars as $var => $val) {
             if (str_contains($output, '%' . $var . '%')) {
-                if ($var == 'message' && $val == '') {
-                    $val = $request['all'];
+                if ($var == 'message' && $val == '' && $requestObj !== null) {
+                    // 访问日志语义：空 message 以请求参数填充（App::send 的 Log::info("") 走此分支）。
+                    // 仅在需要时才调用 all()，避免每条日志都采集全量请求输入
+                    $val = $requestObj->all();
                 }
                 $output = str_replace('%' . $var . '%', $this->stringify($val), $output);
             }
@@ -144,19 +128,22 @@ class LogFormatter extends NormalizerFormatter
 
         // Replace request-related placeholders using str_replace (faster than preg_replace)
         $replacements = [
-            '%request_id%' => $request['requestId'] ?? '',
-            '%uri%' => $request['uri'] ?? '',
-            '%remote_ip%' => $request['remoteIp'] ?? '',
-            '%server_ip%' => $request['localIp'] ?? '',
-            '%used_time%' => isset($request['usedTime']) ? $this->stringify($request['usedTime']) : '0',
-            '%user_agent%' => $request['userAgent'] ?? '',
+            '%request_id%' => $requestObj?->requestId() ?? '',
+            '%uri%' => $requestObj?->uri() ?? '',
+            '%remote_ip%' => $requestObj?->getRemoteIp() ?? '',
+            '%server_ip%' => $requestObj?->getLocalIp() ?? '',
+            '%used_time%' => $requestObj !== null ? $this->stringify($requestObj->usedTime()) : '0',
+            '%user_agent%' => $requestObj?->header('user-agent') ?? '',
             '%run_type%' => defined('RUN_TYPE') ? RUN_TYPE : '',
         ];
         $output = str_replace(array_keys($replacements), array_values($replacements), $output);
 
         // P2-49：剥离 ANSI 颜色码，防止终端色码泄漏到文件日志
         if ($this->stripAnsi) {
-            $output = preg_replace('/\x1b\[[0-9;]*[a-zA-Z]/', '', $output);
+            $stripped = preg_replace('/\x1b\[[0-9;]*[a-zA-Z]/', '', $output);
+            if ($stripped !== null) {
+                $output = $stripped;
+            }
         }
 
         return $output;
@@ -255,25 +242,21 @@ class LogFormatter extends NormalizerFormatter
         $str .= '): ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine() . ')';
 
         if ($this->includeStacktraces) {
-            $str .= $this->stacktracesParser($e);
+            $str .= $this->renderStackTrace($e);
         }
 
         return $str;
     }
 
-    private function stacktracesParser(\Throwable $e): string
+    private function renderStackTrace(\Throwable $e): string
     {
         $trace = $e->getTraceAsString();
 
-        if ($this->stacktracesParser) {
-            $trace = $this->stacktracesParserCustom($trace);
+        // 自定义 parser 按行过滤（此前属性与方法同名导致 parser 被错误地以 Throwable 为参调用）
+        if ($this->stacktraceParser) {
+            $trace = implode("\n", array_filter(array_map($this->stacktraceParser, explode("\n", $trace))));
         }
 
         return "\n[stacktrace]\n" . $trace . "\n";
-    }
-
-    private function stacktracesParserCustom(string $trace): string
-    {
-        return implode("\n", array_filter(array_map($this->stacktracesParser, explode("\n", $trace))));
     }
 }

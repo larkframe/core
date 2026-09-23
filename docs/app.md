@@ -10,7 +10,7 @@
 |------|---------|---------|
 | Server | `php server.php` | `server.php` |
 | Shell | `php shell.php route "key=value"` | `shell.php` |
-| Task | `php task.php taskname [args]` | `task.php` |
+| Task | `php task.php <taskname> [start\|stop\|restart\|reload\|status] [args]` | `task.php` |
 | Web | 浏览器访问 | `public/index.php` |
 
 - **Server 模式**：`php server.php` 启动常驻内存 Worker 进程，监听 HTTP 请求
@@ -34,7 +34,9 @@ require __DIR__ . '/vendor/autoload.php';
 LarkFrame\App::run(LarkFrame\Consts::RUN_TYPE_TASK);
 
 // public/index.php
-require dirname(__DIR__) . '/vendor/autoload.php';
+// FPM 下 cwd 取决于 fastcgi 配置，建议显式定义 ROOT_PATH（未定义时框架自动向上探测）
+define('ROOT_PATH', dirname(__DIR__));
+require ROOT_PATH . '/vendor/autoload.php';
 LarkFrame\App::run(LarkFrame\Consts::RUN_TYPE_WEB);
 ```
 
@@ -216,5 +218,8 @@ Web 模式下：
 - 调试模式（`app.debug = true`）：返回完整异常信息（含堆栈、文件路径）
 - 支持自定义错误页面模板：`config('error_page.template')`
 - 支持 404/500 等状态码跳转：`config('error_page.404')`
+- `error.catch` 控制是否注册自定义错误处理器（`error.handler` + `error.options`），
+  四种模式统一生效；Server/Task 模式错误转 `ErrorException` 由请求级 try-catch 记录，
+  Web/Shell 模式记录日志并抑制
 
 > **安全提示**：`app.debug` 默认为 `false`。生产环境切勿开启 debug 模式，否则会向客户端泄露服务器内部路径和堆栈信息。

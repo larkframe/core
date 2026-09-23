@@ -219,16 +219,26 @@ if (!function_exists('config_path')) {
 if (!function_exists('runtime_path')) {
     /**
      * Runtime path
+     *
+     * app.runtime_path 支持相对路径（基于 ROOT_PATH 解析，不依赖进程 cwd）。
+     * 时序契约：config/config.php 在配置加载完成前被 require，其中直接调用
+     * runtime_path() 只能取到默认目录；配置内的日志/缓存路径请写成闭包
+     * （fn() => runtime_path('logs/app.log')），由 Log/Cache 在实例化时延迟求值。
+     *
      * @param string $path
      * @return string
      */
     function runtime_path(string $path = ''): string
     {
-        static $runtimePath = '';
-        if (!$runtimePath) {
-            $runtimePath = \config('app.runtime_path') ?: run_path('runtime');
+        $configured = \LarkFrame\Config::get('app.runtime_path');
+        if (is_string($configured) && $configured !== '') {
+            // 不缓存：配置加载前后调用需返回不同结果（加载前回退默认目录）
+            $isAbsolute = str_starts_with($configured, DIRECTORY_SEPARATOR)
+                || preg_match('#^[A-Za-z]:[/\\\\]#', $configured) === 1;
+            $base = $isAbsolute ? $configured : path_combine(ROOT_PATH, $configured);
+            return path_combine($base, $path);
         }
-        return path_combine($runtimePath, $path);
+        return path_combine(run_path('runtime'), $path);
     }
 }
 
@@ -324,14 +334,14 @@ if (!function_exists('getRealHost')) {
      */
     function getRealHost(bool $withoutPort = false): string
     {
-        // 检查常见的代理头
-        $possibleHeaders = [
-            'HTTP_X_FORWARDED_HOST',
-            'HTTP_X_FORWARDED_SERVER',
-            'HTTP_HOST',
-            'SERVER_NAME',
-            'SERVER_ADDR'
-        ];
+        $trustedProxies = Config::get('app.trusted_proxies', []);
+        $remoteAddr = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
+        $isTrustedProxy = $trustedProxies === '*' || in_array($remoteAddr, (array)$trustedProxies, true);
+
+        // 仅在请求来自受信代理时才读取转发头，防止伪造 X-Forwarded-Host 导致 Host 注入（对齐 getClientIp）
+        $possibleHeaders = $isTrustedProxy
+            ? ['HTTP_X_FORWARDED_HOST', 'HTTP_X_FORWARDED_SERVER', 'HTTP_HOST', 'SERVER_NAME', 'SERVER_ADDR']
+            : ['HTTP_HOST', 'SERVER_NAME', 'SERVER_ADDR'];
 
         foreach ($possibleHeaders as $header) {
             if (!empty($_SERVER[$header])) {

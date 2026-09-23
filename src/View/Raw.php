@@ -7,7 +7,6 @@ use Throwable;
 use function array_merge;
 use function config;
 use function extract;
-use function is_array;
 use function is_file;
 use function ob_end_clean;
 use function ob_get_clean;
@@ -38,11 +37,19 @@ class Raw implements View
             $viewSuffix = config("view.options.view_suffix", 'php');
         }
 
-        // P2-22：用 is_file 替代 file_exists（后者对目录也返回 true），缺失时抛异常 fail-fast
-        $__template_path__ = ROOT_PATH . DIRECTORY_SEPARATOR . 'template' . DIRECTORY_SEPARATOR . $template . '.' . $viewSuffix;
-        if (!is_file($__template_path__)) {
+        $templateDir = ROOT_PATH . DIRECTORY_SEPARATOR . 'template';
+        $__template_path__ = $templateDir . DIRECTORY_SEPARATOR . $template . '.' . $viewSuffix;
+
+        // 防路径穿越：$template 含 ../ 时可 include 模板目录之外的任意 PHP 文件（LFI），
+        // 真实路径必须仍位于模板目录内；is_file 同时排除目录误判（P2-22）
+        $realTemplateDir = realpath($templateDir);
+        $realPath = realpath($__template_path__);
+        if ($realTemplateDir === false || $realPath === false
+            || !str_starts_with($realPath, $realTemplateDir . DIRECTORY_SEPARATOR)
+            || !is_file($realPath)) {
             throw new RuntimeException("Template not found: {$template}.{$viewSuffix} (path: {$__template_path__})");
         }
+        $__template_path__ = $realPath;
 
         $allVars = array_merge(ViewVarHolder::getVars(), $vars);
 

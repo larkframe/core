@@ -88,10 +88,12 @@ class Pool implements PoolInterface
 
     /**
      * Constructor with property promotion for config values.
+     *
+     * @param array $config 原始配置（fromConfig 解析后各字段已展开为独立参数，此参数仅为位置兼容保留）
      */
     public function __construct(
         private readonly int $maxConnections = 1,
-        private readonly array $config = [],
+        array $config = [],
         private readonly int $minConnections = 1,
         private readonly float $idleTimeout = 60.0,
         private readonly float $heartbeatInterval = 50.0,
@@ -166,13 +168,22 @@ class Pool implements PoolInterface
     {
         // Non-coroutine: reuse a single connection with heartbeat validation
         if (!$this->isCoroutine()) {
-            // 已有连接则用心跳回调校验活性，避免返回已被服务端关闭的死连接
-            if ($this->nonCoroutineConnection !== null && $this->connectionHeartbeatHandler !== null) {
-                try {
-                    ($this->connectionHeartbeatHandler)($this->nonCoroutineConnection);
-                } catch (Throwable) {
-                    $this->closeConnection($this->nonCoroutineConnection);
-                    $this->nonCoroutineConnection = null;
+            // 已有连接则用心跳回调校验活性，避免返回已被服务端关闭的死连接。
+            // 按 heartbeat_interval 节流：原实现每次 get() 都探测，等于给每个操作多加一次网络往返
+            // （Redis PING / MySQL ping）；heartbeat_interval <= 0 视为未配置节流，保持每次都探测，
+            // 不引入活性校验空窗。
+            $conn = $this->nonCoroutineConnection;
+            if ($conn !== null && $this->connectionHeartbeatHandler !== null) {
+                $shouldProbe = $this->heartbeatInterval <= 0
+                    || (microtime(true) - ($this->lastHeartbeatTimes[$conn] ?? 0.0)) >= $this->heartbeatInterval;
+                if ($shouldProbe) {
+                    try {
+                        ($this->connectionHeartbeatHandler)($conn);
+                        $this->lastHeartbeatTimes[$conn] = microtime(true);
+                    } catch (Throwable) {
+                        $this->closeConnection($conn);
+                        $this->nonCoroutineConnection = null;
+                    }
                 }
             }
             if ($this->nonCoroutineConnection === null) {
@@ -217,6 +228,11 @@ class Pool implements PoolInterface
     {
         if (!isset($this->connections[$connection])) {
             throw new PoolException('The connection does not belong to the connection pool.');
+        }
+
+        // 幂等防护：已处于 Idle 状态说明已被归还过，重复 push 会导致同一连接被两个协程同时借出
+        if ($this->getConnectionStatus($connection) === ConnectionStatus::Idle) {
+            return;
         }
 
         if ($connection === $this->nonCoroutineConnection) {

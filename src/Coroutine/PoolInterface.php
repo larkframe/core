@@ -20,11 +20,6 @@ interface PoolInterface
     public function put(object $connection): void;
 
     /**
-     * Create a new connection.
-     */
-    public function createConnection(): object;
-
-    /**
      * Close the connection and remove it from the connection pool.
      */
     public function closeConnection(object $connection): void;

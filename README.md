@@ -45,7 +45,10 @@ require __DIR__ . '/vendor/autoload.php';
 LarkFrame\App::run(LarkFrame\Consts::RUN_TYPE_TASK);
 
 // public/index.php — Web 模式入口
-require dirname(__DIR__) . '/vendor/autoload.php';
+// FPM 下 cwd 取决于 fastcgi 配置，建议显式定义 ROOT_PATH（未定义时框架基于
+// vendor/ 与入口文件自动向上探测）
+define('ROOT_PATH', dirname(__DIR__));
+require ROOT_PATH . '/vendor/autoload.php';
 LarkFrame\App::run(LarkFrame\Consts::RUN_TYPE_WEB);
 ```
 
@@ -90,7 +93,8 @@ class AuthMiddleware implements \LarkFrame\MiddlewareInterface
     public function process(\LarkFrame\Request $request, callable $next): \LarkFrame\Response
     {
         if (!$request->header('authorization')) {
-            return json(['error' => 'Unauthorized'], 401);
+            // 注意：json() 第二个参数是 JSON 编码选项而非状态码，状态码用 withStatus()
+            return json(['error' => 'Unauthorized'])->withStatus(401);
         }
         return $next($request);
     }
@@ -167,7 +171,7 @@ core/src/
 ├── Queue/               # 队列（Redis 驱动、Job、Worker）
 ├── Request/             # 请求源（Server/Web/Shell）
 ├── Response/            # 响应发送器
-├── Util/                # 工具集（Str、Rand、Base64、File、Img、Mock）
+├── Util/                # 工具集（Str、Rand、Base64、File、Img、Mock、UtilProxy）
 ├── View/                # 视图（Raw PHP、Twig）
 ├── App.php              # 应用入口
 ├── Config.php           # 配置管理

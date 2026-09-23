@@ -17,9 +17,15 @@ class Rand
      */
     public static function numberInt(int $min = 0, int $max = 100): int
     {
+        // 参数非法应显式失败而非静默兜底：random_int 的 ValueError 属 Error 体系，
+        // 原 catch (\Exception) 捕获不到会直接 fatal，且 mt_rand 兜底会掩盖参数错误
+        if ($min > $max) {
+            throw new \InvalidArgumentException("min ({$min}) must be less than or equal to max ({$max})");
+        }
         try {
             return random_int($min, $max);
-        } catch (\Exception) {
+        } catch (\Throwable) {
+            // CSPRNG 不可用时的兜底（参数已前置校验，此处只剩熵源故障）
             return mt_rand($min, $max);
         }
     }
@@ -29,8 +35,11 @@ class Rand
      */
     public static function numberFloat(int $min = 0, int $max = 100, int $decimalPlaces = 2): float
     {
-        if ($min >= $max) {
-            return 0.0;
+        if ($min > $max) {
+            throw new \InvalidArgumentException("min ({$min}) must be less than or equal to max ({$max})");
+        }
+        if ($min === $max) {
+            return (float)$min;
         }
 
         $factor = pow(10, $decimalPlaces);
@@ -65,13 +74,25 @@ class Rand
         if ($characters === '') {
             $characters = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()_+-=[]{}|;:,.<>?';
         }
+        if ($length < 1) {
+            return '';
+        }
 
         $charactersLength = strlen($characters);
-        $bytes = random_bytes($length);
-        $result = '';
+        // 拒绝采样消除模偏差：ord % len 在 256 % len != 0 时前若干字符概率偏高，
+        // 该方法用于验证码/token 生成，熵损耗必须消除
+        $validRange = intdiv(256, $charactersLength) * $charactersLength;
 
-        for ($i = 0; $i < $length; $i++) {
-            $result .= $characters[ord($bytes[$i]) % $charactersLength];
+        $result = '';
+        while (strlen($result) < $length) {
+            foreach (str_split(random_bytes($length)) as $byte) {
+                if (ord($byte) < $validRange) {
+                    $result .= $characters[ord($byte) % $charactersLength];
+                    if (strlen($result) >= $length) {
+                        break;
+                    }
+                }
+            }
         }
         return $result;
     }
@@ -103,6 +124,11 @@ class Rand
     {
         if ($array === []) {
             return null;
+        }
+
+        // count<=0 直接返回空数组：array_rand(…, 0) 在 PHP 8 抛 ValueError
+        if ($count < 1) {
+            return [];
         }
 
         $count = min($count, count($array));

@@ -447,7 +447,7 @@ class Select implements EventInterface
         foreach ($fds as $fd) {
             $fdKey = (int)$fd;
             if (isset($events[$fdKey])) {
-                $events[$fdKey]($fd);
+                $this->safeCall($events[$fdKey], [$fd]);
             }
         }
     }

@@ -15,14 +15,11 @@ public function indexAction(Request $request)
     // 请求路径
     $path = $request->path();            // /users/1
 
-    // 请求 ID（自动生成）
+    // 请求 ID（自动生成，32 位十六进制随机串）
     $requestId = $request->requestId();
 
     // 客户端 IP
     $ip = $request->getRemoteIp();
-
-    // 请求时间
-    $startTime = $request->startTime();
 }
 ```
 
@@ -33,14 +30,19 @@ public function indexAction(Request $request)
 $request->get('key', $default);
 $request->get();  // 所有 GET 参数
 
-// POST 参数
+// POST 参数（Server 模式下 body 惰性解析：不访问 post/file 时不产生解析开销）
 $request->post('key', $default);
 $request->post(); // 所有 POST 参数
 
 // 合并 GET + POST
 $request->all();
-$request->input('key', $default);  // 优先 GET，其次 POST
+// input() 优先 GET：GET 命中时不会触发 POST body 解析
+$request->input('key', $default);
 ```
+
+POST body 支持表单（`application/x-www-form-urlencoded`）与 JSON
+（`Content-Type` 含 `json` 时自动 `json_decode`）两种格式，multipart 文件上传
+走 `uploadFile()`。
 
 ## 文件上传
 
@@ -81,9 +83,13 @@ $request->header();  // 所有请求头
 | `queryString()` | 查询字符串 |
 | `rawBody()` | 原始请求体 |
 | `rawBuffer()` | 原始 buffer |
-| `usedTime()` | 请求耗时（秒） |
+| `usedTime()` | 请求耗时（**毫秒**，int；亚毫秒返回 3 位小数） |
 | `cookie()` | 获取 Cookie |
-| `file()` | 获取上传文件信息 |
+| `file()` | 获取上传文件信息（原始数组） |
+| `getRemoteIp()` | 对端 IP |
+| `getRealIp()` | 真实客户端 IP（需配置 `app.trusted_proxies` 才信任 XFF 头） |
+| `route()` | 当前路由对象（`param()` 取路由参数） |
+| `controller()` / `action()` | 当前控制器/方法名 |
 
 ## 请求源
 

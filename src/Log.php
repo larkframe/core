@@ -12,7 +12,7 @@ use function is_array;
 
 /**
  * Class Log
- * @package support
+ * @package LarkFrame
  *
  * @method static void log($level, $message, array $context = [])
  * @method static void debug($message, array $context = [])
@@ -41,12 +41,11 @@ class Log
         if (!isset(static::$instance[$name])) {
             $logConfig = config('log', []);
             if (!is_array($logConfig)) {
-                throw new \InvalidArgumentException('log config must be an array');
+                $logConfig = [];
             }
-            $config = $logConfig[$name] ?? null;
-            if ($config === null) {
-                throw new \InvalidArgumentException("Log channel '{$name}' not configured");
-            }
+            // 未配置的通道回退默认 handler 而非抛异常：日志是最后一道防线，
+            // 配置缺失不应让调用链（含错误处理器自身）在记录错误时二次崩溃
+            $config = $logConfig[$name] ?? [];
 
             $handlers = self::handlers($config);
             $processors = self::processors($config);
@@ -68,9 +67,13 @@ class Log
     {
         // 默认 StreamHandler，level 根据 app.debug 动态决定：开发 DEBUG / 生产 INFO
         $defaultLevel = config('app.debug', false) ? Logger::DEBUG : Logger::INFO;
-        $handlerConfigs = $config['handlers'] ?? [
-            ['class' => \Monolog\Handler\StreamHandler::class, 'constructor' => [runtime_path('logs/app.log'), $defaultLevel]]
-        ];
+        $handlerConfigs = $config['handlers'] ?? [];
+        // 显式配置为空数组同样回退默认（?? 不会命中空数组，会把所有日志静默丢弃）
+        if ($handlerConfigs === []) {
+            $handlerConfigs = [
+                ['class' => \Monolog\Handler\StreamHandler::class, 'constructor' => [runtime_path('logs/app.log'), $defaultLevel]]
+            ];
+        }
         $handlers = [];
         foreach ($handlerConfigs as $value) {
             $class = $value['class'] ?? '';
@@ -86,6 +89,11 @@ class Log
 
     /**
      * Handler.
+     *
+     * constructor 参数支持 Closure 延迟求值：config.php 在配置加载完成前被 require，
+     * 其中直接调用 runtime_path() 只能取到默认目录；写成
+     * `fn() => runtime_path('logs/app.log')` 即可在本方法实例化时（配置已就绪）求值。
+     *
      * @param string $class
      * @param array $constructor
      * @param array $formatterConfig
@@ -94,19 +102,30 @@ class Log
     protected static function handler(string $class, array $constructor, array $formatterConfig): HandlerInterface
     {
         /** @var HandlerInterface $handler */
-        $handler = new $class(... array_values($constructor));
+        $handler = new $class(... self::resolveConstructor($constructor));
 
         if ($handler instanceof FormattableHandlerInterface && $formatterConfig) {
             $formatterClass = $formatterConfig['class'] ?? null;
             $formatterConstructor = $formatterConfig['constructor'] ?? [];
             if ($formatterClass !== null) {
                 /** @var FormatterInterface $formatter */
-                $formatter = new $formatterClass(... array_values($formatterConstructor));
+                $formatter = new $formatterClass(... self::resolveConstructor($formatterConstructor));
                 $handler->setFormatter($formatter);
             }
         }
 
         return $handler;
+    }
+
+    /**
+     * 解析构造参数：Closure 项在实例化时调用（延迟求值），其余原样返回。
+     */
+    protected static function resolveConstructor(array $constructor): array
+    {
+        return array_map(
+            static fn(mixed $arg): mixed => $arg instanceof \Closure ? $arg() : $arg,
+            array_values($constructor)
+        );
     }
 
     /**
@@ -123,7 +142,7 @@ class Log
 
         foreach ($config['processors'] ?? [] as $value) {
             if (is_array($value) && isset($value['class'])) {
-                $value = new $value['class'](... array_values($value['constructor'] ?? []));
+                $value = new $value['class'](... self::resolveConstructor($value['constructor'] ?? []));
             }
             $result[] = $value;
         }

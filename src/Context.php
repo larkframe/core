@@ -2,24 +2,10 @@
 
 namespace LarkFrame;
 
-use LarkFrame\Coroutine\Context as CoroutineContext;
-use Closure;
-
-class Context extends CoroutineContext
+/**
+ * 应用层上下文入口。onDestroy 等能力由 Coroutine\Context 提供并直接继承，
+ * 此前存在与父类逐行相同的冗余重写，已删除。
+ */
+class Context extends Coroutine\Context
 {
-    /**
-     * Register a callback to be executed when the current context is destroyed.
-     *
-     * @param Closure $closure
-     * @return void
-     */
-    public static function onDestroy(Closure $closure): void
-    {
-        $obj = static::get('context.onDestroy');
-        if (!$obj) {
-            $obj = new \stdClass();
-            static::set('context.onDestroy', $obj);
-        }
-        Coroutine\DestructionWatcher::watch($obj, $closure);
-    }
 }

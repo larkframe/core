@@ -75,6 +75,8 @@ Redis::use('default', 2)->get('key');           // default 连接，database 2
 
 在 Server 模式下，Redis 自动使用连接池管理：
 
-- 每个连接名维护独立的连接池
-- 支持空闲连接回收和心跳检测
+- 每个连接名维护独立的连接池，池配置位于各连接的 `pool` 键
+  （`max_connections` / `min_connections` / `idle_timeout` / `wait_timeout` / `heartbeat_interval`）
+- 池为懒创建（首个请求时），空闲回收与心跳检测定时器在池创建时自动注册到事件循环
 - `Redis::use('cache', 1)` 会动态创建独立连接池
+- `client => 'predis'` 时连接关闭走 `disconnect()`（phpredis 走 `close()`），两者均受支持；非法 client 值会显式抛异常而非静默降级

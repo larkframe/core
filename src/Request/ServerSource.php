@@ -2,17 +2,7 @@
 
 namespace LarkFrame\Request;
 
-use LarkFrame\Util\Rand;
-use function file_get_contents;
-use function getallheaders;
-use function gethostname;
-use function json_decode;
 use function microtime;
-use function parse_str;
-use function strtolower;
-use function substr;
-use function md5;
-use function uniqid;
 
 /**
  * Class ServerSource
@@ -29,8 +19,9 @@ class ServerSource implements RequestSourceInterface
     public function populateData(array &$data): void
     {
         // Server mode: data is populated lazily by parse methods in Request
-        // Only set requestId and startTime here
-        $data['requestId'] = strtolower(substr(md5(microtime() . uniqid(gethostname() . '_', true)), 8, 16) . Rand::str(16));
+        // Only set requestId and startTime here.
+        // 单次 CSPRNG 调用替代 md5+uniqid+gethostname+Rand::str 组合（省系统调用与拒绝采样开销）
+        $data['requestId'] = bin2hex(random_bytes(16));
         $data['startTime'] = microtime(true);
     }
 

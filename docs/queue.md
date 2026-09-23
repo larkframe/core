@@ -2,34 +2,36 @@
 
 `LarkFrame\Queue` 提供基于 Redis 的队列系统，支持延迟推送、消息确认和失败重试。
 
+驱动实现 `LarkFrame\Queue\QueueInterface` 契约（含 `getFailedJobs`/`retryFailed`），
+门面方法直接面向接口调用，自定义驱动需实现全部接口方法。
+
 ## 推送任务
 
 ```php
 use LarkFrame\Queue;
 
-// 即时推送
+// 即时推送（推荐：任务类名）
 Queue::push('emails', SendEmailJob::class, ['to' => 'user@example.com']);
 Queue::push('orders', ProcessOrderJob::class, ['order_id' => 123]);
 
 // 延迟推送（60 秒后执行）
 Queue::later('notifications', 60, SendNotification::class, ['user_id' => 1]);
-
-// 推送闭包
-Queue::push('tasks', function (Job $job) {
-    // 处理逻辑
-    $job->ack();
-});
 ```
+
+> **注意**：闭包不可序列化（`serialize(Closure)` 直接抛异常），请使用任务类名；
+> 推送对象实例时走 `serialize()`，消费端 `Job::fire()` 会以
+> `allowed_classes => true` 反序列化——队列内容不是可信边界，任何能写入 Redis
+> 的攻击面都可能注入 POP 链，生产环境请确保 Redis 访问受控并仅推送类名。
 
 ## 消费任务
 
 ```php
-// 弹出单个任务
+// 弹出单个任务（队列名省略时使用配置 queue.default）
 $job = Queue::pop('emails');
 if ($job) {
     try {
         $job->fire();   // 执行任务
-        $job->ack();    // 确认完成
+        $job->ack();    // 确认完成（handler 内已 ack 时为幂等 no-op）
     } catch (\Throwable $e) {
         $job->fail($e); // 标记失败
     }
@@ -55,7 +57,7 @@ $worker->daemon('emails');
 ## 队列管理
 
 ```php
-// 队列大小
+// 队列大小（队列名省略时使用配置 queue.default）
 $size = Queue::size('emails');
 
 // 清空队列
@@ -63,7 +65,7 @@ Queue::clear('emails');
 
 // 失败任务
 $failed = Queue::getFailedJobs('emails');
-Queue::retryFailed('emails', 0);  // 重试第 0 个失败任务
+Queue::retryFailed('emails', 0);  // 重试第 0 个失败任务（Lua 原子完成取出+删除+重新入队）
 ```
 
 ## 任务类

@@ -31,10 +31,10 @@ Db::use('order_db')->table('orders')->get();
 Db::use('mysql_slave')->table('reports')->get();
 ```
 
-配置：
+配置（框架仅加载 `config/config.php`、`config/task.php` 与 `config.{env}.php` 覆盖文件，数据库配置必须位于 `config/config.php` 的 `database` 键下）：
 
 ```php
-// config/database.php
+// config/config.php
 'database' => [
     'default' => 'mysql',
     'connections' => [
@@ -100,7 +100,9 @@ try {
 
 ### 连接池与事务安全
 
-Server 模式下数据库连接通过连接池管理，请求结束时自动归还。若请求中开启了事务但未 commit/rollback，`DatabaseManager` 会在归还前自动检测并回滚未提交的事务（`transactionLevel() > 0` 时调用 `rollBack()`），防止脏状态泄漏到下一个请求。
+Server 模式下数据库连接通过连接池管理，请求结束时自动归还。若请求中开启了事务但未 commit/rollback，`DatabaseManager` 会在归还前自动检测并**逐层回滚**未提交的嵌套事务（`transactionLevel() > 0` 时循环 `rollBack()`），防止残留层级污染下一个借用方。
+
+连接池配置位于各连接的 `pool` 键（`max_connections` / `min_connections` / `idle_timeout` / `wait_timeout` / `heartbeat_interval`），池为懒创建，空闲回收与心跳检测定时器在池创建时自动注册到事件循环（Server 模式）。
 
 最佳实践仍是显式提交或回滚事务，自动回滚仅作为兜底机制。
 

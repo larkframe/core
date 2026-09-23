@@ -8,7 +8,6 @@ use LarkFrame\Response\ServerSender;
 use LarkFrame\Response\WebSender;
 use Stringable;
 use Throwable;
-use function array_merge_recursive;
 use function explode;
 use function file;
 use function filemtime;
@@ -240,7 +239,15 @@ class Response implements Stringable
      */
     public function withHeaders(array $headers): static
     {
-        $this->headers = array_merge_recursive($this->headers, $headers);
+        foreach ($headers as $name => $value) {
+            // Set-Cookie 允许多值（追加）；其余同名头覆盖，避免 array_merge_recursive
+            // 把标量同名头合并成数组，导致重复 Content-Length/Content-Type 破坏报文
+            if (strcasecmp((string)$name, 'Set-Cookie') === 0) {
+                $this->headers[$name] = array_merge((array)($this->headers[$name] ?? []), (array)$value);
+            } else {
+                $this->headers[$name] = $value;
+            }
+        }
         return $this;
     }
 
@@ -335,9 +342,17 @@ class Response implements Stringable
 
         $fileSize = filesize($file);
 
-        // 自动解析 Range 请求头（仅当未显式指定 offset/length 时）
+        // 自动解析 Range 请求头（仅当未显式指定 offset/length 时）。
+        // Server/Shell 模式下 $_SERVER 是 CLI 进程变量不含请求头，必须从当前 Request 读取；
+        // FPM 模式无请求上下文时回退 $_SERVER
         if ($offset === 0 && $length === 0) {
-            $range = $_SERVER['HTTP_RANGE'] ?? null;
+            $range = null;
+            $request = App::request();
+            if ($request !== null) {
+                $range = $request->header('range');
+            } else {
+                $range = $_SERVER['HTTP_RANGE'] ?? null;
+            }
             if ($range !== null && is_string($range)) {
                 [$offset, $length] = $this->parseRangeHeader($range, $fileSize);
             }
@@ -528,7 +543,7 @@ class Response implements Stringable
         if (empty($this->headers)) {
             $headers = [
                 'Server' => 'lark-server',
-                'Content-Type' => ' text/html;charset=utf-8',
+                'Content-Type' => 'text/html; charset=utf-8',
                 'Content-Length' => $bodyLen,
                 'Connection' => 'keep-alive',
             ];

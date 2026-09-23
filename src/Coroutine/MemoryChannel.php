@@ -4,15 +4,16 @@ namespace LarkFrame\Coroutine;
 
 use Fiber;
 use SplQueue;
-use Throwable;
 
 /**
  * Class MemoryChannel
  *
  * In-memory channel implementation with coroutine-aware blocking support.
- * When a pop is called on an empty channel within a Fiber, it will yield
- * and retry instead of busy-waiting. In non-Fiber contexts, it falls back
- * to a timed sleep-based wait.
+ *
+ * 超时唤醒契约：Fiber 内 pop/push 挂起时，会向 Worker::$globalEvent 注册
+ * 一次性 delay 定时器，deadline 到达后 resume 该 Fiber（若仍处于挂起态）。
+ * 无事件循环的裸 Fiber 调度场景（用户自管调度器）无法注册定时器，
+ * 挂起协程只能被后续 push/pop/close 唤醒——timeout 在该场景不生效。
  */
 class MemoryChannel implements ChannelInterface
 {
@@ -59,17 +60,13 @@ class MemoryChannel implements ChannelInterface
             $this->wakePopWaiter();
             while (!$this->queue->isEmpty()) {
                 if ($this->closed) {
+                    // close 语义为丢弃通道内一切数据，残留可接受
                     return false;
                 }
                 if (microtime(true) >= $deadline) {
-                    return false;
+                    return $this->revokeRendezvousData($data);
                 }
-                if (Fiber::getCurrent() !== null) {
-                    $this->pushWaiters[] = Fiber::getCurrent();
-                    Fiber::suspend();
-                } else {
-                    usleep(self::POLL_INTERVAL_US);
-                }
+                $this->suspendUntil($this->pushWaiters, $deadline);
             }
             return true;
         }
@@ -79,12 +76,7 @@ class MemoryChannel implements ChannelInterface
                 return false;
             }
 
-            if (Fiber::getCurrent() !== null) {
-                $this->pushWaiters[] = Fiber::getCurrent();
-                Fiber::suspend();
-            } else {
-                usleep(self::POLL_INTERVAL_US);
-            }
+            $this->suspendUntil($this->pushWaiters, $deadline);
 
             if ($this->closed) {
                 return false;
@@ -94,6 +86,25 @@ class MemoryChannel implements ChannelInterface
         $this->queue->enqueue($data);
         $this->wakePopWaiter();
 
+        return true;
+    }
+
+    /**
+     * Rendezvous 超时回滚：数据已入队但无人消费时必须撤回，
+     * 否则消费方会取到一条 push 方已判定失败的"幽灵"数据。
+     */
+    private function revokeRendezvousData(mixed $data): bool
+    {
+        // 队列已空：数据刚好被消费，push 语义上成功
+        if ($this->queue->isEmpty()) {
+            return true;
+        }
+        // FIFO 下队头是自己入队的数据则撤回；队头是他人数据说明自己已被消费。
+        // 边界：他人推送了与 $data === 全等的值时会被误撤（概率可忽略）
+        if ($this->queue->bottom() === $data) {
+            $this->queue->dequeue();
+            return false;
+        }
         return true;
     }
 
@@ -124,18 +135,7 @@ class MemoryChannel implements ChannelInterface
                 return false;
             }
 
-            if (Fiber::getCurrent() !== null) {
-                // In Fiber context: suspend and wait to be resumed
-                $this->popWaiters[] = Fiber::getCurrent();
-                Fiber::suspend();
-            } else {
-                // In non-Fiber context: sleep briefly and retry
-                usleep(self::POLL_INTERVAL_US);
-            }
-        }
-
-        if ($this->queue->isEmpty()) {
-            return false;
+            $this->suspendUntil($this->popWaiters, $deadline);
         }
 
         $data = $this->queue->dequeue();
@@ -150,6 +150,56 @@ class MemoryChannel implements ChannelInterface
         }
 
         return $data;
+    }
+
+    /**
+     * 挂起当前 Fiber 等待唤醒（数据到达 / 空间释放 / 通道关闭 / 超时）。
+     *
+     * 唤醒来源：
+     *   1. wakePopWaiter/wakePushWaiter/close 的 resume
+     *   2. deadline 前注册到事件循环的超时定时器 resume（无事件循环时不注册）
+     *
+     * 醒来后先把自己从等待队列移除——否则超时返回的 Fiber 引用
+     * 残留在数组中形成强引用泄漏，且后续 wake 会反复空唤醒。
+     * 误唤醒（新一轮等待被上一轮定时器触发）是安全的：
+     * 调用方循环条件会重新判定队列状态与 deadline。
+     */
+    private function suspendUntil(array &$waiters, float $deadline): void
+    {
+        $fiber = Fiber::getCurrent();
+        if ($fiber === null) {
+            usleep(self::POLL_INTERVAL_US);
+            return;
+        }
+
+        $waiters[] = $fiber;
+
+        $loop = null;
+        $timerId = null;
+        if ($deadline < PHP_FLOAT_MAX && \LarkFrame\Worker::$globalEvent !== null) {
+            $loop = \LarkFrame\Worker::$globalEvent;
+            $remaining = $deadline - microtime(true);
+            if ($remaining > 0) {
+                $timerId = $loop->delay($remaining, static function () use ($fiber): void {
+                    // 数据先到时 fiber 已被唤醒运行/终止，此时非挂起态，跳过避免 Fatal
+                    if ($fiber->isSuspended()) {
+                        $fiber->resume();
+                    }
+                });
+            }
+        }
+
+        try {
+            Fiber::suspend();
+        } finally {
+            if ($timerId !== null) {
+                $loop->offDelay($timerId);
+            }
+            $idx = array_search($fiber, $waiters, true);
+            if ($idx !== false) {
+                unset($waiters[$idx]);
+            }
+        }
     }
 
     public function length(): int
